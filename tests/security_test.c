@@ -94,42 +94,33 @@ static void test_security_policy(void)
         ) == 0);
     }
 
-    /* Three failed passwords activate temporary authentication backoff. */
+    /* Three bad passwords lock the account for five minutes. */
     security_policy_note_auth_failure(policy, "127.0.0.1", "TestUser", 20000);
     security_policy_note_auth_failure(policy, "127.0.0.1", "TestUser", 20001);
     security_policy_note_auth_failure(policy, "127.0.0.1", "TestUser", 20002);
 
     CHECK(security_policy_allow_auth_attempt(
-        policy,
-        "127.0.0.1",
-        "TestUser",
-        20003,
-        &retry
+        policy, "127.0.0.1", "TestUser", 20003, &retry
     ) == 0);
-    CHECK(retry > 0);
+    CHECK(retry >= 299000);
 
     CHECK(security_policy_allow_auth_attempt(
-        policy,
-        "127.0.0.1",
-        "TestUser",
-        22000,
-        &retry
+        policy, "127.0.0.1", "TestUser", 319999, &retry
+    ) == 0);
+
+    CHECK(security_policy_allow_auth_attempt(
+        policy, "127.0.0.1", "TestUser", 320002, &retry
+    ) == 1);
+
+    /* A new typo after expiry doesn't instantly lock the account again. */
+    security_policy_note_auth_failure(policy, "127.0.0.1", "TestUser", 320003);
+    CHECK(security_policy_allow_auth_attempt(
+        policy, "127.0.0.1", "TestUser", 320004, &retry
     ) == 1);
 
     security_policy_note_auth_success(
-        policy,
-        "127.0.0.1",
-        "TestUser",
-        22000
+        policy, "127.0.0.1", "TestUser", 320005
     );
-
-    CHECK(security_policy_allow_auth_attempt(
-        policy,
-        "127.0.0.1",
-        "TestUser",
-        22001,
-        &retry
-    ) == 1);
 
     /* Account creation has an independent peer limit. */
     for (i = 0; i < 10; ++i) {

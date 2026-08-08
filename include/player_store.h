@@ -19,7 +19,7 @@ extern "C" {
 #endif
 
 #define PLAYER_NAME_MIN 3
-#define PLAYER_NAME_MAX 24
+#define PLAYER_NAME_MAX 15
 #define PLAYER_PASSWORD_MIN 8
 #define PLAYER_PASSWORD_MAX 128
 #define PLAYER_PASSWORD_TOKEN_BYTES 256
@@ -45,7 +45,7 @@ void player_store_close(player_store *store);
 /*
  * Validates a player identifier.
  *
- * Accepted form: 3-24 ASCII letters, digits, '_' or '-'.
+ * Accepted form: 3-15 ASCII letters, digits, '_' or '-'.
  * This check runs before a name is used to construct a filesystem path.
  */
 int player_store_name_valid(const char *name);

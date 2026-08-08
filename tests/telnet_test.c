@@ -698,6 +698,73 @@ static void test_operational_telnet(void)
     fixture_close(&fixture, NULL);
 }
 
+/* ---------- Older TLS/Telnet client compatibility ---------- */
+
+static void test_old_client_controls(void)
+{
+    struct fixture fixture;
+    struct output_capture output = {0};
+    telnet_session *session;
+
+    fixture_open(&fixture, "/tmp/telnet-old-client-test-XXXXXX");
+    session = make_session(
+        &fixture,
+        "127.0.0.1",
+        capture_write,
+        &output
+    );
+    CHECK(session != NULL);
+
+    telnet_session_start(session);
+    clear_capture(&output);
+
+    {
+        const unsigned char old_client_controls[] = {
+            'J', 'o', 'h', 'n',
+            3, 3, 3, 21, 12, 3, 3,
+            '\r', '\n'
+        };
+
+        CHECK(telnet_session_feed_at(
+            session,
+            old_client_controls,
+            sizeof(old_client_controls),
+            1800
+        ) == 0);
+    }
+
+    CHECK(!telnet_session_should_close(session));
+    CHECK(!capture_contains_text(&output, "Protocol error"));
+    CHECK(capture_contains_text(&output, "New player"));
+
+    telnet_session_destroy(session);
+    fixture_close(&fixture, NULL);
+}
+
+static void test_new_account_name_limit(void)
+{
+    struct fixture fixture;
+    struct output_capture output = {0};
+    telnet_session *session;
+
+    fixture_open(&fixture, "/tmp/telnet-name-limit-test-XXXXXX");
+    session = make_session(
+        &fixture,
+        "127.0.0.1",
+        capture_write,
+        &output
+    );
+    CHECK(session != NULL);
+    telnet_session_start(session);
+    clear_capture(&output);
+    feed_text(session, "SixteenCharsHere\r\n", 1900);
+    CHECK(capture_contains_text(&output, "3-15 characters"));
+    CHECK(!capture_contains_text(&output, "Create a password"));
+
+    telnet_session_destroy(session);
+    fixture_close(&fixture, NULL);
+}
+
 /* ---------- Hostile and malformed input ---------- */
 
 static void test_malformed_input(void)
@@ -814,6 +881,8 @@ int main(void)
     test_option_state();
     test_login_and_commands();
     test_operational_telnet();
+    test_old_client_controls();
+    test_new_account_name_limit();
     test_malformed_input();
 
     puts("telnet test passed");

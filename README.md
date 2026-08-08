@@ -48,6 +48,8 @@ Those checks are useful evidence. They aren't a security claim.
 The listener is IPv4 loopback-only. Public bind/firewall/certificate handling
 is outside the current scope.
 
+Account identifiers currently accept 3-15 ASCII letters, digits, `_` or `-`.
+
 Player passwords currently accept 8-128 characters. The built-in weak-password
 list is small. A public deployment should use a maintained compromised-password
 corpus as part of account policy.

@@ -30,6 +30,10 @@
 #define GLOBAL_CONNECTION_LIMIT 30
 #define GLOBAL_CONNECTION_WINDOW_MS 10000ULL
 
+/* Three bad passwords pause an account for five minutes. */
+#define ACCOUNT_AUTH_FAILURE_LIMIT 3U
+#define ACCOUNT_AUTH_LOCK_MS 300000ULL
+
 /* Account-creation windows protect password hashing and filesystem work. */
 #define PEER_CREATION_LIMIT 10
 #define PEER_CREATION_WINDOW_MS 600000ULL
@@ -304,22 +308,10 @@ static uint64_t peer_backoff_ms(unsigned int failures)
 
 static uint64_t account_backoff_ms(unsigned int failures)
 {
-    unsigned int shift;
-    uint64_t delay;
-
-    if (failures < 5) {
-        return 0;
-    }
-
-    shift = failures - 5;
-    if (shift > 3) {
-        shift = 3;
-    }
-
-    delay = 1000ULL << shift;
-    return delay > 8000ULL ? 8000ULL : delay;
+    return failures >= ACCOUNT_AUTH_FAILURE_LIMIT
+        ? ACCOUNT_AUTH_LOCK_MS
+        : 0;
 }
-
 security_policy *security_policy_create(void)
 {
     security_policy *policy = calloc(1, sizeof(*policy));
@@ -434,6 +426,19 @@ int security_policy_allow_auth_attempt(
         player_name,
         now_ms
     );
+
+    /* A completed cooldown starts a fresh set of attempts. */
+    if (peer_record->auth_blocked_until_ms != 0 &&
+        peer_record->auth_blocked_until_ms <= now_ms) {
+        peer_record->auth_failures = 0;
+        peer_record->auth_blocked_until_ms = 0;
+    }
+
+    if (account_record->auth_blocked_until_ms != 0 &&
+        account_record->auth_blocked_until_ms <= now_ms) {
+        account_record->auth_failures = 0;
+        account_record->auth_blocked_until_ms = 0;
+    }
 
     if (peer_record->auth_blocked_until_ms > now_ms) {
         peer_wait =

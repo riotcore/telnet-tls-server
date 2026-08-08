@@ -78,6 +78,10 @@ int main(void)
     /* Identifier validation runs before path construction. */
     CHECK(player_store_name_valid("TestUser"));
     CHECK(player_store_name_valid("abc"));
+
+    CHECK(player_store_name_valid("123456789012345"));
+    CHECK(PLAYER_NAME_MAX == 15);
+    CHECK(!player_store_name_valid("1234567890123456"));
     CHECK(!player_store_name_valid("ab"));
     CHECK(!player_store_name_valid("../bad"));
 

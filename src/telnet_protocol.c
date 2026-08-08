@@ -616,7 +616,7 @@ static void process_player_name(telnet_session *session)
         write_text(
             session,
             "\r\n"
-            "Player names must be 3-24 characters and use only "
+            "New player names must be 3-15 characters and use only "
             "letters, numbers, '_' or '-'.\r\n"
             "Player name: "
         );
@@ -686,7 +686,7 @@ static void process_existing_password(
 
         write_text(
             session,
-            "\r\nToo many login attempts. Try again shortly.\r\n"
+            "\r\nLogin is temporarily locked. Try again later.\r\n"
             "Password: "
         );
         return;
@@ -728,6 +728,23 @@ static void process_existing_password(
     );
 
     audit_player_event(session, "login_failure");
+    /* The third bad password starts the account cooldown immediately. */
+    if (!security_policy_allow_auth_attempt(
+            session->security,
+            session->remote_id,
+            session->player_name,
+            now_ms,
+            &retry_ms
+        )) {
+        request_close(
+            session,
+            "login_lockout",
+            "\r\nIncorrect password.\r\n"
+            "Too many failed passwords. Try again in 5 minutes.\r\n"
+        );
+        return;
+    }
+
     write_text(session, "\r\nIncorrect password.\r\nPassword: ");
 }
 
@@ -1032,7 +1049,11 @@ static void append_line_byte(
     }
 
     if (byte < 32) {
-        note_protocol_violation(session, "unexpected control byte");
+        /*
+         * Real terminal clients can emit local C0 controls while editing.
+         * They aren't command text, so discard them quietly here.
+         * Malformed Telnet IAC/subnegotiation is still handled strictly.
+         */
         return;
     }
 
@@ -1068,20 +1089,16 @@ static void receive_data_byte(
             return;
         }
 
-        if (!session->terminal.remote_binary && byte == '\0') {
+        if (byte == '\0') {
             append_line_byte(session, '\r');
             return;
         }
 
-        if (!session->terminal.remote_binary) {
-            note_protocol_violation(
-                session,
-                "NVT CR not followed by LF or NUL"
-            );
-        }
-
+        /*
+         * Some terminal clients are loose about NVT CR framing. Preserve
+         * the carriage return and continue without counting it as abuse.
+         */
         append_line_byte(session, '\r');
-
         if (session->close_requested) {
             return;
         }
@@ -1093,15 +1110,12 @@ static void receive_data_byte(
     }
 
     if (byte == '\n') {
-        if (!session->terminal.remote_binary) {
-            note_protocol_violation(session, "bare NVT LF accepted");
-        }
+        /* Bare LF is common in terminal tools and is safe as a line end. */
         process_complete_line(session, now_ms);
         return;
     }
 
-    if (byte == '\0' && !session->terminal.remote_binary) {
-        /* A lone NVT NUL doesn't do anything useful for this line parser. */
+    if (byte == '\0') {
         return;
     }
 
