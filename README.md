@@ -116,6 +116,8 @@ chmod 600 local_tls/server.key
 chmod 644 local_tls/server.crt
 ```
 
+Because TLS is established before Telnet negotiation, a plain telnet command won't connect directly. For local testing, use the included telnet_client.
+
 Start the server from the repository root:
 
 ```bash
