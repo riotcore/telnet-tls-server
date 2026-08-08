@@ -1,0 +1,31 @@
+# Build output
+build/
+build-fuzz/
+cmake-build-*/
+
+# Runtime state and local credentials
+data/
+logs/
+local_tls/
+
+# Fuzzer and crash artifacts
+crash-*
+leak-*
+timeout-*
+oom-*
+*.core
+core
+
+# Compiler output
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+
+# Local editor/OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
