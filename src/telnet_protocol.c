@@ -4,11 +4,17 @@
 /*
  * telnet_protocol.c
  *
- * Implements one authenticated Telnet session. Responsibilities include raw
- * Telnet parsing, option negotiation, NVT line handling, capability discovery,
- * login state, password prompts, input-rate limits, control functions, and the
- * current command loop. The transport supplies decrypted bytes and receives
- * encoded Telnet output through the writer callback.
+ * Telnet/NVT owner for the standalone C MUD connection slice. This file turns
+ * an arbitrary stream of transport bytes into line-oriented application input,
+ * owns Telnet option/subnegotiation handling and terminal capability discovery,
+ * and encodes application output back onto the Telnet stream. It does not own
+ * sockets or TLS; those arrive through the writer/feed boundary.
+ *
+ * The small login and command loop also lives here today so this repository is
+ * independently runnable and testable. That is a packaging decision, not a
+ * requirement that MUD authentication forever belong to Telnet. When the game
+ * grows multiple transports, account and game-session ownership should move
+ * above this adapter while this parser/capability layer remains unchanged.
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -49,9 +55,18 @@ enum parser_state {
 enum {
     TERMINAL_TYPE_IS = 0,
     TERMINAL_TYPE_SEND = 1,
+
     CHARSET_REQUEST = 1,
     CHARSET_ACCEPTED = 2,
-    CHARSET_REJECTED = 3
+    CHARSET_REJECTED = 3,
+
+    NEW_ENVIRON_IS = 0,
+    NEW_ENVIRON_SEND = 1,
+    NEW_ENVIRON_INFO = 2,
+    NEW_ENVIRON_VAR = 0,
+    NEW_ENVIRON_VAL = 1,
+    NEW_ENVIRON_ESC = 2,
+    NEW_ENVIRON_USERVAR = 3
 };
 
 /* Per-session fixed window used for byte, line, and command ceilings. */
@@ -76,7 +91,16 @@ struct telnet_session {
 
     telnet_q options;
     int echo_desired;
-    int terminal_type_requested;
+
+    /* Capability probes are bounded and never gate login. */
+    unsigned int terminal_type_requests_sent;
+    int terminal_type_waiting;
+    char last_terminal_type[TELNET_TERMINAL_TYPE_MAX + 1];
+    int charset_request_sent;
+    int charset_utf8;
+    int new_environ_requested;
+    int mnes_observed;
+    int insecure_warning_shown;
 
     unsigned char subnegotiation_option;
     unsigned char subnegotiation[256];
@@ -110,6 +134,7 @@ struct telnet_session {
 #define COMMANDS_WINDOW_MS 5000ULL
 #define SUBNEGOTIATION_MAX_BYTES 256U
 #define PROTOCOL_VIOLATION_LIMIT 8U
+#define TERMINAL_TYPE_REQUEST_LIMIT 4U
 
 #define DEFAULT_TERMINAL_WIDTH 80U
 #define DEFAULT_TERMINAL_HEIGHT 24U
@@ -228,6 +253,47 @@ static void write_text(telnet_session *session, const char *text)
     );
 }
 
+
+/*
+ * Prompts intentionally lack CRLF, so mark their boundary when the peer has a
+ * Telnet mechanism for it. EOR is preferred. Before SGA is agreed (or when it
+ * is refused), ordinary Telnet GA remains the standards-compatible fallback.
+ */
+static void write_prompt_text(telnet_session *session, const char *text)
+{
+    write_text(session, text);
+
+    if (session->terminal.local_eor) {
+        const unsigned char marker[2] = {
+            TELNET_IAC,
+            TELNET_EOR
+        };
+        write_raw(session, marker, sizeof(marker));
+    } else if (!session->terminal.local_suppress_go_ahead) {
+        const unsigned char marker[2] = {
+            TELNET_IAC,
+            TELNET_GA
+        };
+        write_raw(session, marker, sizeof(marker));
+    }
+}
+
+static void warn_insecure_password_once(telnet_session *session)
+{
+    if (session->terminal.secure_transport ||
+        session->insecure_warning_shown) {
+        return;
+    }
+
+    session->insecure_warning_shown = 1;
+    write_text(
+        session,
+        "\r\n"
+        "[Notice: plain Telnet is not encrypted; use the TLS endpoint "
+        "when available.]\r\n"
+    );
+}
+
 static void write_untrusted_text(
     telnet_session *session,
     const char *text
@@ -285,6 +351,8 @@ static int q_accept_callback(
         switch (option) {
             case TELNET_OPT_BINARY:
             case TELNET_OPT_SUPPRESS_GO_AHEAD:
+            case TELNET_OPT_END_OF_RECORD:
+            case TELNET_OPT_CHARSET:
                 return 1;
 
             case TELNET_OPT_ECHO:
@@ -300,6 +368,7 @@ static int q_accept_callback(
         case TELNET_OPT_SUPPRESS_GO_AHEAD:
         case TELNET_OPT_TERMINAL_TYPE:
         case TELNET_OPT_NAWS:
+        case TELNET_OPT_NEW_ENVIRON:
         case TELNET_OPT_CHARSET:
             return 1;
 
@@ -344,13 +413,36 @@ static void send_subnegotiation(
     write_raw(session, end, sizeof(end));
 }
 
+static void apply_mtts_flags(telnet_session *session, uint32_t flags)
+{
+    session->terminal.mtts_flags = flags;
+    session->terminal.ansi = (flags & TELNET_MTTS_ANSI) != 0;
+    session->terminal.vt100 = (flags & TELNET_MTTS_VT100) != 0;
+    session->terminal.color_256 =
+        (flags & TELNET_MTTS_256_COLORS) != 0;
+    session->terminal.truecolor =
+        (flags & TELNET_MTTS_TRUECOLOR) != 0;
+    session->terminal.screen_reader =
+        (flags & TELNET_MTTS_SCREEN_READER) != 0;
+    session->terminal.mnes = (flags & TELNET_MTTS_MNES) != 0;
+}
+
+static void refresh_utf8_metadata(telnet_session *session)
+{
+    session->terminal.utf8_enabled =
+        session->charset_utf8 ||
+        (session->terminal.mtts_flags & TELNET_MTTS_UTF8) != 0;
+}
+
 static void request_terminal_type(telnet_session *session)
 {
     const unsigned char payload[1] = {
         TERMINAL_TYPE_SEND
     };
 
-    if (session->terminal_type_requested ||
+    if (session->terminal_type_waiting ||
+        session->terminal_type_requests_sent >=
+            TERMINAL_TYPE_REQUEST_LIMIT ||
         !telnet_q_enabled(
             &session->options,
             TELNET_Q_REMOTE,
@@ -359,10 +451,77 @@ static void request_terminal_type(telnet_session *session)
         return;
     }
 
-    session->terminal_type_requested = 1;
+    ++session->terminal_type_requests_sent;
+    session->terminal_type_waiting = 1;
     send_subnegotiation(
         session,
         TELNET_OPT_TERMINAL_TYPE,
+        payload,
+        sizeof(payload)
+    );
+}
+
+static void request_charset(telnet_session *session)
+{
+    const unsigned char payload[] = {
+        CHARSET_REQUEST,
+        ';',
+        'U', 'T', 'F', '-', '8'
+    };
+
+    /*
+     * RFC 2066 permits either side to initiate CHARSET. Supporting both roles
+     * avoids depending on one client-specific negotiation ordering.
+     */
+    if (session->charset_request_sent ||
+        !session->terminal.local_binary ||
+        !session->terminal.remote_binary ||
+        !telnet_q_enabled(
+            &session->options,
+            TELNET_Q_LOCAL,
+            TELNET_OPT_CHARSET
+        )) {
+        return;
+    }
+
+    session->charset_request_sent = 1;
+    send_subnegotiation(
+        session,
+        TELNET_OPT_CHARSET,
+        payload,
+        sizeof(payload)
+    );
+}
+
+static void request_new_environ(telnet_session *session)
+{
+    static const unsigned char payload[] = {
+        NEW_ENVIRON_SEND,
+        NEW_ENVIRON_VAR,
+        'C','L','I','E','N','T','_','N','A','M','E',
+        NEW_ENVIRON_VAR,
+        'C','L','I','E','N','T','_','V','E','R','S','I','O','N',
+        NEW_ENVIRON_VAR,
+        'C','H','A','R','S','E','T',
+        NEW_ENVIRON_VAR,
+        'M','T','T','S',
+        NEW_ENVIRON_VAR,
+        'T','E','R','M','I','N','A','L','_','T','Y','P','E'
+    };
+
+    if (session->new_environ_requested ||
+        !telnet_q_enabled(
+            &session->options,
+            TELNET_Q_REMOTE,
+            TELNET_OPT_NEW_ENVIRON
+        )) {
+        return;
+    }
+
+    session->new_environ_requested = 1;
+    send_subnegotiation(
+        session,
+        TELNET_OPT_NEW_ENVIRON,
         payload,
         sizeof(payload)
     );
@@ -394,22 +553,36 @@ static void update_option_metadata(telnet_session *session)
         TELNET_OPT_SUPPRESS_GO_AHEAD
     );
 
-    if (!session->terminal.local_binary ||
-        !session->terminal.remote_binary ||
-        !telnet_q_enabled(
-            &session->options,
-            TELNET_Q_REMOTE,
-            TELNET_OPT_CHARSET
-        )) {
-        session->terminal.utf8_enabled = 0;
-    }
+    session->terminal.local_eor = telnet_q_enabled(
+        &session->options,
+        TELNET_Q_LOCAL,
+        TELNET_OPT_END_OF_RECORD
+    );
 
+    session->terminal.new_environ = telnet_q_enabled(
+        &session->options,
+        TELNET_Q_REMOTE,
+        TELNET_OPT_NEW_ENVIRON
+    );
+
+    /* NEW-ENVIRON is the carrier; MNES is the MUD-specific vocabulary. */
+    session->terminal.mnes =
+        (session->terminal.mtts_flags & TELNET_MTTS_MNES) != 0 ||
+        session->mnes_observed;
+
+    refresh_utf8_metadata(session);
     request_terminal_type(session);
+    request_charset(session);
+    request_new_environ(session);
 }
 
 static void negotiate_operational_options(telnet_session *session)
 {
-    /* Start with the boring basics: BINARY and SUPPRESS-GO-AHEAD both ways. */
+    /*
+     * A MUD must remain playable when every request below is refused. These
+     * negotiations only improve terminal behavior; login is never delayed for
+     * capability discovery.
+     */
     telnet_q_request(
         &session->options,
         TELNET_Q_LOCAL,
@@ -443,7 +616,16 @@ static void negotiate_operational_options(telnet_session *session)
         session
     );
 
-    /* Ask for the terminal details the application can actually use. */
+    /* EOR gives MUD clients an explicit boundary for prompts without newlines. */
+    telnet_q_request(
+        &session->options,
+        TELNET_Q_LOCAL,
+        TELNET_OPT_END_OF_RECORD,
+        1,
+        q_send_callback,
+        session
+    );
+
     telnet_q_request(
         &session->options,
         TELNET_Q_REMOTE,
@@ -460,10 +642,33 @@ static void negotiate_operational_options(telnet_session *session)
         q_send_callback,
         session
     );
+
+    /*
+     * CHARSET is offered in both directions. Some clients initiate the request;
+     * others expect the server to do it after accepting WILL CHARSET.
+     */
+    telnet_q_request(
+        &session->options,
+        TELNET_Q_LOCAL,
+        TELNET_OPT_CHARSET,
+        1,
+        q_send_callback,
+        session
+    );
     telnet_q_request(
         &session->options,
         TELNET_Q_REMOTE,
         TELNET_OPT_CHARSET,
+        1,
+        q_send_callback,
+        session
+    );
+
+    /* MNES/NEW-ENVIRON supplements MTTS with updateable client metadata. */
+    telnet_q_request(
+        &session->options,
+        TELNET_Q_REMOTE,
+        TELNET_OPT_NEW_ENVIRON,
         1,
         q_send_callback,
         session
@@ -604,8 +809,8 @@ static void enter_game(telnet_session *session)
         session,
         ". You are now in game.\r\n"
         "Type PING to test the command loop.\r\n"
-        "> "
     );
+    write_prompt_text(session, "> ");
 }
 
 static void process_player_name(telnet_session *session)
@@ -618,8 +823,8 @@ static void process_player_name(telnet_session *session)
             "\r\n"
             "New player names must be 3-15 characters and use only "
             "letters, numbers, '_' or '-'.\r\n"
-            "Player name: "
         );
+        write_prompt_text(session, "Player name: ");
         return;
     }
 
@@ -642,24 +847,27 @@ static void process_player_name(telnet_session *session)
             session,
             "\r\n"
             "That player record could not be read safely.\r\n"
-            "Player name: "
         );
+        write_prompt_text(session, "Player name: ");
         return;
     }
 
     if (exists == 1) {
         session->login = LOGIN_PASSWORD;
         password_echo_off(session);
-        write_text(session, "Password: ");
+        warn_insecure_password_once(session);
+        write_prompt_text(session, "Password: ");
         return;
     }
 
     session->login = LOGIN_NEW_PASSWORD;
     password_echo_off(session);
+    warn_insecure_password_once(session);
 
-    write_text(
+    write_text(session, "New player. ");
+    write_prompt_text(
         session,
-        "New player. Create a password (8-128 characters): "
+        "Create a password (8-128 characters): "
     );
 }
 
@@ -687,8 +895,8 @@ static void process_existing_password(
         write_text(
             session,
             "\r\nLogin is temporarily locked. Try again later.\r\n"
-            "Password: "
         );
+        write_prompt_text(session, "Password: ");
         return;
     }
 
@@ -745,7 +953,8 @@ static void process_existing_password(
         return;
     }
 
-    write_text(session, "\r\nIncorrect password.\r\nPassword: ");
+    write_text(session, "\r\nIncorrect password.\r\n");
+    write_prompt_text(session, "Password: ");
 }
 
 static void process_new_password(telnet_session *session)
@@ -759,8 +968,8 @@ static void process_new_password(telnet_session *session)
         write_text(
             session,
             "\r\nPassword must contain at least 8 characters.\r\n"
-            "Create password: "
         );
+        write_prompt_text(session, "Create password: ");
         return;
     }
 
@@ -779,8 +988,8 @@ static void process_new_password(telnet_session *session)
         write_text(
             session,
             "\r\nChoose a less common password.\r\n"
-            "Create password: "
         );
+        write_prompt_text(session, "Create password: ");
         return;
     }
 
@@ -799,8 +1008,8 @@ static void process_new_password(telnet_session *session)
         write_text(
             session,
             "\r\nUnable to prepare the password securely.\r\n"
-            "Player name: "
         );
+        write_prompt_text(session, "Player name: ");
         return;
     }
 
@@ -808,7 +1017,8 @@ static void process_new_password(telnet_session *session)
     session->line_length = 0;
 
     session->login = LOGIN_CONFIRM_PASSWORD;
-    write_text(session, "\r\nConfirm password: ");
+    write_text(session, "\r\n");
+    write_prompt_text(session, "Confirm password: ");
 }
 
 static void process_password_confirmation(
@@ -833,8 +1043,8 @@ static void process_password_confirmation(
         write_text(
             session,
             "\r\nPasswords did not match.\r\n"
-            "Create password: "
         );
+        write_prompt_text(session, "Create password: ");
         return;
     }
 
@@ -859,8 +1069,8 @@ static void process_password_confirmation(
         write_text(
             session,
             "\r\nAccount creation is temporarily limited.\r\n"
-            "Player name: "
         );
+        write_prompt_text(session, "Player name: ");
         return;
     }
 
@@ -886,8 +1096,8 @@ static void process_password_confirmation(
                 "\r\n"
                 "The player account could not be created. "
                 "It may already exist.\r\n"
-                "Player name: "
             );
+            write_prompt_text(session, "Player name: ");
             return;
         }
     }
@@ -926,16 +1136,18 @@ static void process_command(
     }
 
     if (session->line[0] == '\0') {
-        write_text(session, "> ");
+        write_prompt_text(session, "> ");
         return;
     }
 
     if (ascii_equal_ignore_case(session->line, "PING")) {
-        write_text(session, "PONG\r\n> ");
+        write_text(session, "PONG\r\n");
+        write_prompt_text(session, "> ");
         return;
     }
 
-    write_text(session, "Unknown command.\r\n> ");
+    write_text(session, "Unknown command.\r\n");
+    write_prompt_text(session, "> ");
 }
 
 static void process_complete_line(
@@ -975,17 +1187,18 @@ static void process_complete_line(
             write_text(session, "\r\nPassword input is too long.\r\n");
 
             if (session->login == LOGIN_PASSWORD) {
-                write_text(session, "Password: ");
+                write_prompt_text(session, "Password: ");
             } else {
                 player_store_password_clear(&session->pending_password);
                 session->login = LOGIN_NEW_PASSWORD;
-                write_text(session, "Create password: ");
+                write_prompt_text(session, "Create password: ");
             }
 
             return;
         }
 
-        write_text(session, "Input is too long.\r\n> ");
+        write_text(session, "Input is too long.\r\n");
+        write_prompt_text(session, "> ");
         return;
     }
 
@@ -1057,11 +1270,12 @@ static void append_line_byte(
         return;
     }
 
-    if (byte >= 128 && !session->terminal.remote_binary) {
-        note_protocol_violation(session, "non-NVT byte before BINARY");
-        return;
-    }
-
+    /*
+     * Strict NVT peers negotiate BINARY before sending 8-bit data, but many
+     * real terminal tools don't. The line buffer is bounded and higher layers
+     * still validate names/passwords, so accept opaque high bytes here instead
+     * of treating a harmless compatibility quirk as protocol abuse.
+     */
     if (session->line_length >= sizeof(session->line) - 1) {
         session->line_overflow = 1;
         return;
@@ -1134,23 +1348,23 @@ static void write_current_prompt(telnet_session *session)
 {
     switch (session->login) {
         case LOGIN_NAME:
-            write_text(session, "Player name: ");
+            write_prompt_text(session, "Player name: ");
             break;
 
         case LOGIN_PASSWORD:
-            write_text(session, "Password: ");
+            write_prompt_text(session, "Password: ");
             break;
 
         case LOGIN_NEW_PASSWORD:
-            write_text(session, "Create password: ");
+            write_prompt_text(session, "Create password: ");
             break;
 
         case LOGIN_CONFIRM_PASSWORD:
-            write_text(session, "Confirm password: ");
+            write_prompt_text(session, "Confirm password: ");
             break;
 
         case LOGIN_IN_GAME:
-            write_text(session, "> ");
+            write_prompt_text(session, "> ");
             break;
     }
 }
@@ -1180,9 +1394,8 @@ static void handle_control_command(
         case TELNET_GA:
         case TELNET_EOR:
             /*
-             * These commands are valid and there's no queued work for them.
-             * Writes are synchronous, SGA is negotiated, and EOR isn't our
-             * record delimiter.
+             * These commands are valid and there is no queued work for them.
+             * Peer GA/EOR markers do not delimit application input here.
              */
             return;
 
@@ -1215,10 +1428,7 @@ static void handle_control_command(
             return;
 
         default:
-            note_protocol_violation(
-                session,
-                "unsupported Telnet command"
-            );
+            /* Unknown but well-framed commands are optional Telnet surface. */
             return;
     }
 }
@@ -1255,10 +1465,7 @@ static void handle_naws(telnet_session *session)
             TELNET_Q_REMOTE,
             TELNET_OPT_NAWS
         )) {
-        note_protocol_violation(
-            session,
-            "NAWS received before negotiation"
-        );
+        /* Some clients eagerly report size before negotiation completes. */
         return;
     }
 
@@ -1290,22 +1497,131 @@ static void handle_naws(telnet_session *session)
     );
 }
 
+static int copy_printable_ascii(
+    char *output,
+    size_t output_size,
+    const unsigned char *input,
+    size_t input_length
+)
+{
+    size_t i;
+
+    if (output == NULL || output_size == 0 ||
+        input_length >= output_size) {
+        return 0;
+    }
+
+    for (i = 0; i < input_length; ++i) {
+        if (input[i] < 32 || input[i] > 126) {
+            return 0;
+        }
+        output[i] = (char)input[i];
+    }
+
+    output[input_length] = '\0';
+    return 1;
+}
+
+static int parse_decimal_u32(
+    const unsigned char *bytes,
+    size_t length,
+    uint32_t *value
+)
+{
+    uint32_t parsed = 0;
+    size_t i;
+
+    if (length == 0 || value == NULL) {
+        return 0;
+    }
+
+    for (i = 0; i < length; ++i) {
+        unsigned int digit;
+
+        if (bytes[i] < '0' || bytes[i] > '9') {
+            return 0;
+        }
+
+        digit = (unsigned int)(bytes[i] - '0');
+        if (parsed > (UINT32_MAX - digit) / 10U) {
+            return 0;
+        }
+        parsed = parsed * 10U + digit;
+    }
+
+    *value = parsed;
+    return 1;
+}
+
+static void infer_terminal_type_capabilities(
+    telnet_session *session,
+    const char *terminal_type
+)
+{
+    size_t length = strlen(terminal_type);
+
+    if (ascii_equal_ignore_case(terminal_type, "ANSI")) {
+        session->terminal.ansi = 1;
+    } else if (ascii_equal_ignore_case(terminal_type, "VT100")) {
+        session->terminal.ansi = 1;
+        session->terminal.vt100 = 1;
+    } else if (ascii_equal_ignore_case(terminal_type, "XTERM")) {
+        session->terminal.ansi = 1;
+        session->terminal.vt100 = 1;
+    }
+
+    if (length >= strlen("-256COLOR") &&
+        ascii_equal_ignore_case(
+            terminal_type + length - strlen("-256COLOR"),
+            "-256COLOR"
+        )) {
+        session->terminal.color_256 = 1;
+    }
+
+    if (length >= strlen("-TRUECOLOR") &&
+        ascii_equal_ignore_case(
+            terminal_type + length - strlen("-TRUECOLOR"),
+            "-TRUECOLOR"
+        )) {
+        session->terminal.color_256 = 1;
+        session->terminal.truecolor = 1;
+    }
+}
+
+static int parse_mtts_report(
+    telnet_session *session,
+    const unsigned char *bytes,
+    size_t length
+)
+{
+    uint32_t flags;
+
+    if (length > 5 &&
+        bytes_equal_ignore_case(bytes, 5, "MTTS ") &&
+        parse_decimal_u32(bytes + 5, length - 5, &flags)) {
+        apply_mtts_flags(session, flags);
+        refresh_utf8_metadata(session);
+        return 1;
+    }
+
+    return 0;
+}
+
 static void handle_terminal_type(telnet_session *session)
 {
     size_t type_length;
-    size_t i;
+    char reported[TELNET_TERMINAL_TYPE_MAX + 1];
+    int repeated;
 
     if (!telnet_q_enabled(
             &session->options,
             TELNET_Q_REMOTE,
             TELNET_OPT_TERMINAL_TYPE
         )) {
-        note_protocol_violation(
-            session,
-            "terminal type received before negotiation"
-        );
         return;
     }
+
+    session->terminal_type_waiting = 0;
 
     if (session->subnegotiation_length < 2 ||
         session->subnegotiation[0] != TERMINAL_TYPE_IS) {
@@ -1318,36 +1634,79 @@ static void handle_terminal_type(telnet_session *session)
 
     type_length = session->subnegotiation_length - 1;
 
-    if (type_length > TELNET_TERMINAL_TYPE_MAX) {
+    if (type_length > TELNET_TERMINAL_TYPE_MAX ||
+        !copy_printable_ascii(
+            reported,
+            sizeof(reported),
+            session->subnegotiation + 1,
+            type_length
+        )) {
         note_protocol_violation(
             session,
-            "terminal type exceeds 40 characters"
+            "invalid terminal type payload"
         );
         return;
     }
 
-    for (i = 0; i < type_length; ++i) {
-        unsigned char ch = session->subnegotiation[i + 1];
-
-        if (ch < 32 || ch > 126) {
-            note_protocol_violation(
-                session,
-                "terminal type is not NVT ASCII"
-            );
-            return;
-        }
-
-        session->terminal.terminal_type[i] = (char)ch;
+    if (reported[0] == '\0') {
+        memcpy(reported, "UNKNOWN", sizeof("UNKNOWN"));
     }
 
-    session->terminal.terminal_type[type_length] = '\0';
-
-    if (type_length == 0) {
-        memcpy(
-            session->terminal.terminal_type,
-            "UNKNOWN",
-            sizeof("UNKNOWN")
+    repeated = session->last_terminal_type[0] != '\0' &&
+        ascii_equal_ignore_case(
+            session->last_terminal_type,
+            reported
         );
+
+    if (!parse_mtts_report(
+            session,
+            (const unsigned char *)reported,
+            strlen(reported)
+        )) {
+        /*
+         * MTTS defines response one as client name and response two as the
+         * terminal type. A legacy client may simply repeat one terminal type,
+         * so the first response is also kept as a useful fallback.
+         */
+        if (session->terminal_type_requests_sent == 1) {
+            memcpy(
+                session->terminal.client_name,
+                reported,
+                strlen(reported) + 1
+            );
+            memcpy(
+                session->terminal.terminal_type,
+                reported,
+                strlen(reported) + 1
+            );
+            infer_terminal_type_capabilities(session, reported);
+        } else if (session->terminal_type_requests_sent == 2) {
+            memcpy(
+                session->terminal.terminal_type,
+                reported,
+                strlen(reported) + 1
+            );
+            infer_terminal_type_capabilities(session, reported);
+        }
+    }
+
+    memcpy(
+        session->last_terminal_type,
+        reported,
+        strlen(reported) + 1
+    );
+
+    /*
+     * A bare ANSI response is a common legacy-terminal signature. Stop after
+     * one probe rather than risking old clients that mishandle TTYPE cycling.
+     */
+    if (session->terminal_type_requests_sent == 1 &&
+        ascii_equal_ignore_case(reported, "ANSI")) {
+        return;
+    }
+
+    if (!repeated) {
+        request_terminal_type(session);
     }
 }
 
@@ -1393,15 +1752,18 @@ static int charset_list_contains_utf8(
 
 static void handle_charset(telnet_session *session)
 {
+    unsigned char kind;
+
     if (!telnet_q_enabled(
             &session->options,
             TELNET_Q_REMOTE,
             TELNET_OPT_CHARSET
+        ) &&
+        !telnet_q_enabled(
+            &session->options,
+            TELNET_Q_LOCAL,
+            TELNET_OPT_CHARSET
         )) {
-        note_protocol_violation(
-            session,
-            "CHARSET received before negotiation"
-        );
         return;
     }
 
@@ -1410,47 +1772,272 @@ static void handle_charset(telnet_session *session)
         return;
     }
 
-    if (session->subnegotiation[0] != CHARSET_REQUEST) {
-        /* We only answer CHARSET requests in the current protocol profile. */
-        note_protocol_violation(
-            session,
-            "unexpected CHARSET response"
+    kind = session->subnegotiation[0];
+
+    if (kind == CHARSET_REQUEST) {
+        if (!telnet_q_enabled(
+                &session->options,
+                TELNET_Q_REMOTE,
+                TELNET_OPT_CHARSET
+            )) {
+            return;
+        }
+
+        if (session->terminal.local_binary &&
+            session->terminal.remote_binary &&
+            charset_list_contains_utf8(
+                session->subnegotiation,
+                session->subnegotiation_length
+            )) {
+            const unsigned char accepted[] = {
+                CHARSET_ACCEPTED,
+                'U', 'T', 'F', '-', '8'
+            };
+
+            send_subnegotiation(
+                session,
+                TELNET_OPT_CHARSET,
+                accepted,
+                sizeof(accepted)
+            );
+            session->charset_utf8 = 1;
+            refresh_utf8_metadata(session);
+            audit(session, "telnet_charset", "UTF-8 accepted");
+        } else {
+            const unsigned char rejected[1] = {
+                CHARSET_REJECTED
+            };
+
+            send_subnegotiation(
+                session,
+                TELNET_OPT_CHARSET,
+                rejected,
+                sizeof(rejected)
+            );
+        }
+        return;
+    }
+
+    if (!telnet_q_enabled(
+            &session->options,
+            TELNET_Q_LOCAL,
+            TELNET_OPT_CHARSET
+        ) || !session->charset_request_sent) {
+        return;
+    }
+
+    if (kind == CHARSET_ACCEPTED &&
+        session->subnegotiation_length == 6 &&
+        bytes_equal_ignore_case(
+            session->subnegotiation + 1,
+            5,
+            "UTF-8"
+        )) {
+        session->charset_utf8 = 1;
+        refresh_utf8_metadata(session);
+        audit(session, "telnet_charset", "UTF-8 accepted");
+        return;
+    }
+
+    if (kind == CHARSET_REJECTED) {
+        session->charset_utf8 = 0;
+        refresh_utf8_metadata(session);
+        return;
+    }
+
+    /* A negotiated but malformed response is different from an unknown option. */
+    note_protocol_violation(session, "malformed CHARSET response");
+}
+
+static int env_name_equals(
+    const unsigned char *name,
+    size_t length,
+    const char *expected
+)
+{
+    return bytes_equal_ignore_case(name, length, expected);
+}
+
+static void apply_new_environ_value(
+    telnet_session *session,
+    const unsigned char *name,
+    size_t name_length,
+    const unsigned char *value,
+    size_t value_length
+)
+{
+    /* The requested names below are the MNES extension vocabulary. */
+    if (env_name_equals(name, name_length, "CLIENT_NAME")) {
+        session->mnes_observed = 1;
+        (void)copy_printable_ascii(
+            session->terminal.client_name,
+            sizeof(session->terminal.client_name),
+            value,
+            value_length
         );
         return;
     }
 
-    if (session->terminal.local_binary &&
-        session->terminal.remote_binary &&
-        charset_list_contains_utf8(
-            session->subnegotiation,
-            session->subnegotiation_length
-        )) {
-        const unsigned char accepted[] = {
-            CHARSET_ACCEPTED,
-            'U', 'T', 'F', '-', '8'
-        };
-
-        send_subnegotiation(
-            session,
-            TELNET_OPT_CHARSET,
-            accepted,
-            sizeof(accepted)
+    if (env_name_equals(name, name_length, "CLIENT_VERSION")) {
+        session->mnes_observed = 1;
+        (void)copy_printable_ascii(
+            session->terminal.client_version,
+            sizeof(session->terminal.client_version),
+            value,
+            value_length
         );
-        session->terminal.utf8_enabled = 1;
-        audit(session, "telnet_charset", "UTF-8 accepted");
-    } else {
-        const unsigned char rejected[1] = {
-            CHARSET_REJECTED
-        };
-
-        send_subnegotiation(
-            session,
-            TELNET_OPT_CHARSET,
-            rejected,
-            sizeof(rejected)
-        );
-        session->terminal.utf8_enabled = 0;
+        return;
     }
+
+    if (env_name_equals(name, name_length, "TERMINAL_TYPE")) {
+        session->mnes_observed = 1;
+        if (copy_printable_ascii(
+                session->terminal.terminal_type,
+                sizeof(session->terminal.terminal_type),
+                value,
+                value_length
+            )) {
+            infer_terminal_type_capabilities(
+                session,
+                session->terminal.terminal_type
+            );
+        }
+        return;
+    }
+
+    if (env_name_equals(name, name_length, "CHARSET")) {
+        session->mnes_observed = 1;
+        session->charset_utf8 =
+            bytes_equal_ignore_case(value, value_length, "UTF-8");
+        refresh_utf8_metadata(session);
+        return;
+    }
+
+    if (env_name_equals(name, name_length, "MTTS")) {
+        session->mnes_observed = 1;
+        uint32_t flags;
+        if (parse_decimal_u32(value, value_length, &flags)) {
+            apply_mtts_flags(session, flags);
+            refresh_utf8_metadata(session);
+        }
+    }
+}
+
+static void handle_new_environ(telnet_session *session)
+{
+    size_t i = 1;
+    unsigned char command;
+
+    if (!telnet_q_enabled(
+            &session->options,
+            TELNET_Q_REMOTE,
+            TELNET_OPT_NEW_ENVIRON
+        )) {
+        return;
+    }
+
+    if (session->subnegotiation_length == 0) {
+        return;
+    }
+
+    command = session->subnegotiation[0];
+    if (command != NEW_ENVIRON_IS && command != NEW_ENVIRON_INFO) {
+        return;
+    }
+
+    while (i < session->subnegotiation_length) {
+        unsigned char name[64];
+        unsigned char value[128];
+        size_t name_length = 0;
+        size_t value_length = 0;
+        unsigned char token = session->subnegotiation[i++];
+        int has_value = 0;
+
+        if (token != NEW_ENVIRON_VAR &&
+            token != NEW_ENVIRON_USERVAR) {
+            /* Unknown layout is harmless capability noise, not abuse. */
+            return;
+        }
+
+        /*
+         * RFC 1572 reserves VAR/VAL/ESC/USERVAR inside a field. ESC quotes the
+         * following byte, so decode into bounded scratch buffers before using
+         * any value. This avoids accepting a truncated prefix from an escaped
+         * or malformed environment report.
+         */
+        while (i < session->subnegotiation_length) {
+            unsigned char byte = session->subnegotiation[i];
+
+            if (byte == NEW_ENVIRON_ESC) {
+                ++i;
+                if (i >= session->subnegotiation_length ||
+                    name_length >= sizeof(name)) {
+                    return;
+                }
+                name[name_length++] = session->subnegotiation[i++];
+                continue;
+            }
+
+            if (byte == NEW_ENVIRON_VAL) {
+                has_value = 1;
+                ++i;
+                break;
+            }
+
+            if (byte == NEW_ENVIRON_VAR ||
+                byte == NEW_ENVIRON_USERVAR) {
+                break;
+            }
+
+            if (name_length >= sizeof(name)) {
+                return;
+            }
+            name[name_length++] = byte;
+            ++i;
+        }
+
+        if (has_value) {
+            while (i < session->subnegotiation_length) {
+                unsigned char byte = session->subnegotiation[i];
+
+                if (byte == NEW_ENVIRON_ESC) {
+                    ++i;
+                    if (i >= session->subnegotiation_length ||
+                        value_length >= sizeof(value)) {
+                        return;
+                    }
+                    value[value_length++] = session->subnegotiation[i++];
+                    continue;
+                }
+
+                if (byte == NEW_ENVIRON_VAR ||
+                    byte == NEW_ENVIRON_USERVAR) {
+                    break;
+                }
+
+                /* A second unescaped VAL inside a value is malformed. */
+                if (byte == NEW_ENVIRON_VAL ||
+                    value_length >= sizeof(value)) {
+                    return;
+                }
+
+                value[value_length++] = byte;
+                ++i;
+            }
+        }
+
+        if (token == NEW_ENVIRON_VAR && name_length > 0) {
+            apply_new_environ_value(
+                session,
+                name,
+                name_length,
+                value,
+                value_length
+            );
+        }
+    }
+
+    update_option_metadata(session);
 }
 
 static void finish_subnegotiation(telnet_session *session)
@@ -1466,6 +2053,10 @@ static void finish_subnegotiation(telnet_session *session)
 
         case TELNET_OPT_CHARSET:
             handle_charset(session);
+            break;
+
+        case TELNET_OPT_NEW_ENVIRON:
+            handle_new_environ(session);
             break;
 
         default:
@@ -1487,6 +2078,16 @@ static void receive_telnet_option(
         TELNET_Q_REMOTE,
         TELNET_OPT_TERMINAL_TYPE
     );
+    int was_local_charset = telnet_q_enabled(
+        &session->options,
+        TELNET_Q_LOCAL,
+        TELNET_OPT_CHARSET
+    );
+    int was_new_environ = telnet_q_enabled(
+        &session->options,
+        TELNET_Q_REMOTE,
+        TELNET_OPT_NEW_ENVIRON
+    );
 
     telnet_q_receive(
         &session->options,
@@ -1498,21 +2099,55 @@ static void receive_telnet_option(
         session
     );
 
-    update_option_metadata(session);
-
     if (was_terminal_type &&
         !telnet_q_enabled(
             &session->options,
             TELNET_Q_REMOTE,
             TELNET_OPT_TERMINAL_TYPE
         )) {
-        session->terminal_type_requested = 0;
+        session->terminal_type_requests_sent = 0;
+        session->terminal_type_waiting = 0;
+        session->last_terminal_type[0] = '\0';
         memcpy(
             session->terminal.terminal_type,
             "UNKNOWN",
             sizeof("UNKNOWN")
         );
     }
+
+    if (was_local_charset &&
+        !telnet_q_enabled(
+            &session->options,
+            TELNET_Q_LOCAL,
+            TELNET_OPT_CHARSET
+        )) {
+        session->charset_request_sent = 0;
+    }
+
+    if (was_new_environ &&
+        !telnet_q_enabled(
+            &session->options,
+            TELNET_Q_REMOTE,
+            TELNET_OPT_NEW_ENVIRON
+        )) {
+        session->new_environ_requested = 0;
+        session->mnes_observed = 0;
+    }
+
+    if (!telnet_q_enabled(
+            &session->options,
+            TELNET_Q_LOCAL,
+            TELNET_OPT_CHARSET
+        ) &&
+        !telnet_q_enabled(
+            &session->options,
+            TELNET_Q_REMOTE,
+            TELNET_OPT_CHARSET
+        )) {
+        session->charset_utf8 = 0;
+    }
+
+    update_option_metadata(session);
 }
 
 int telnet_protocol_init(void)
@@ -1549,8 +2184,14 @@ telnet_session *telnet_session_create(
     session->parser = PARSER_DATA;
     session->terminal.width = DEFAULT_TERMINAL_WIDTH;
     session->terminal.height = DEFAULT_TERMINAL_HEIGHT;
+    session->terminal.secure_transport = config->transport_secure != 0;
     memcpy(
         session->terminal.terminal_type,
+        "UNKNOWN",
+        sizeof("UNKNOWN")
+    );
+    memcpy(
+        session->terminal.client_name,
         "UNKNOWN",
         sizeof("UNKNOWN")
     );
@@ -1598,8 +2239,8 @@ void telnet_session_start(telnet_session *session)
         "        Welcome, traveler.\r\n"
         "========================================\r\n"
         "\r\n"
-        "Player name: "
     );
+    write_prompt_text(session, "Player name: ");
 }
 
 int telnet_session_feed_at(
@@ -1785,6 +2426,11 @@ void telnet_session_get_terminal_info(
         info->height = DEFAULT_TERMINAL_HEIGHT;
         memcpy(
             info->terminal_type,
+            "UNKNOWN",
+            sizeof("UNKNOWN")
+        );
+        memcpy(
+            info->client_name,
             "UNKNOWN",
             sizeof("UNKNOWN")
         );

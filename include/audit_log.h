@@ -5,11 +5,13 @@
 #define AUDIT_LOG_H
 
 /*
- * Security audit logging.
+ * Security audit logging shared by the connection layer.
  *
- * The logger owns file creation, rotation, field cleanup, and serialized writes.
- * Callers give it short event metadata. Passwords, password hashes, private keys,
- * and raw command text don't belong here.
+ * This is intentionally not a MUD gameplay log. The logger owns security-event
+ * file creation, rotation, field cleanup, and serialized writes so transport,
+ * authentication, and abuse-policy code do not each invent their own logging
+ * format. Callers provide short event metadata; passwords, hashes, private keys,
+ * and raw player command text do not belong here.
  */
 
 #ifdef __cplusplus

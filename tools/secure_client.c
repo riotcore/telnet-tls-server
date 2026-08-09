@@ -5,9 +5,9 @@
  * secure_client.c
  *
  * Small development client for the encrypted listener. It verifies the local
- * certificate, speaks the Telnet options used by the server, hides password
- * input when ECHO is negotiated, and restores the terminal before it exits.
- * Its job is local protocol testing, so the feature set stays deliberately small.
+ * certificate, exercises the Telnet capability paths used by the server, hides
+ * password input when ECHO is negotiated, and restores the terminal on exit.
+ * It is a regression tool rather than a replacement for a real MUD client.
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -41,7 +41,11 @@ enum {
     TERMINAL_TYPE_SEND = 1,
     CHARSET_REQUEST = 1,
     CHARSET_ACCEPTED = 2,
-    CHARSET_REJECTED = 3
+    CHARSET_REJECTED = 3,
+    NEW_ENVIRON_IS = 0,
+    NEW_ENVIRON_SEND = 1,
+    NEW_ENVIRON_VAR = 0,
+    NEW_ENVIRON_VAL = 1
 };
 
 /* Parser states mirror the server wire grammar for local interoperability tests. */
@@ -65,6 +69,7 @@ struct client_state {
     telnet_q options;
     int utf8_enabled;
     int charset_requested;
+    unsigned int ttype_requests_received;
     int write_failed;
     unsigned char utf8_pending[4];
     size_t utf8_length;
@@ -343,6 +348,7 @@ static int q_accept_callback(
             case TELNET_OPT_NAWS:
             case TELNET_OPT_TERMINAL_TYPE:
             case TELNET_OPT_CHARSET:
+            case TELNET_OPT_NEW_ENVIRON:
                 return 1;
 
             default:
@@ -354,6 +360,8 @@ static int q_accept_callback(
         case TELNET_OPT_BINARY:
         case TELNET_OPT_SUPPRESS_GO_AHEAD:
         case TELNET_OPT_ECHO:
+        case TELNET_OPT_END_OF_RECORD:
+        case TELNET_OPT_CHARSET:
             return 1;
 
         default:
@@ -483,15 +491,24 @@ static void terminal_type_name(char output[41])
 
 static int send_terminal_type(struct client_state *state)
 {
-    char type[41];
-    unsigned char payload[42];
+    char text[48];
+    unsigned char payload[49];
     size_t length;
 
-    terminal_type_name(type);
-    length = strlen(type);
+    ++state->ttype_requests_received;
 
+    if (state->ttype_requests_received == 1) {
+        memcpy(text, "TELNET-CLIENT", sizeof("TELNET-CLIENT"));
+    } else if (state->ttype_requests_received == 2) {
+        terminal_type_name(text);
+    } else {
+        /* This development client only promises UTF-8 from the MTTS set. */
+        memcpy(text, "MTTS 4", sizeof("MTTS 4"));
+    }
+
+    length = strlen(text);
     payload[0] = TERMINAL_TYPE_IS;
-    memcpy(payload + 1, type, length);
+    memcpy(payload + 1, text, length);
 
     return send_subnegotiation(
         state,
@@ -499,6 +516,72 @@ static int send_terminal_type(struct client_state *state)
         payload,
         length + 1
     );
+}
+
+static int send_new_environ(struct client_state *state)
+{
+    char terminal[41];
+    unsigned char payload[192];
+    size_t used = 0;
+    const char *charset = state->utf8_enabled ? "UTF-8" : "ASCII";
+    const char *mtts = state->utf8_enabled ? "4" : "0";
+
+#define APPEND_BYTE(value) \
+    do { \
+        if (used >= sizeof(payload)) return -1; \
+        payload[used++] = (unsigned char)(value); \
+    } while (0)
+#define APPEND_TEXT(value) \
+    do { \
+        const char *append_text_value = (value); \
+        size_t append_text_length = strlen(append_text_value); \
+        if (append_text_length > sizeof(payload) - used) return -1; \
+        memcpy(payload + used, append_text_value, append_text_length); \
+        used += append_text_length; \
+    } while (0)
+
+    terminal_type_name(terminal);
+    APPEND_BYTE(NEW_ENVIRON_IS);
+    APPEND_BYTE(NEW_ENVIRON_VAR); APPEND_TEXT("CLIENT_NAME");
+    APPEND_BYTE(NEW_ENVIRON_VAL); APPEND_TEXT("TELNET-CLIENT");
+    APPEND_BYTE(NEW_ENVIRON_VAR); APPEND_TEXT("CLIENT_VERSION");
+    APPEND_BYTE(NEW_ENVIRON_VAL); APPEND_TEXT("development");
+    APPEND_BYTE(NEW_ENVIRON_VAR); APPEND_TEXT("CHARSET");
+    APPEND_BYTE(NEW_ENVIRON_VAL); APPEND_TEXT(charset);
+    APPEND_BYTE(NEW_ENVIRON_VAR); APPEND_TEXT("MTTS");
+    APPEND_BYTE(NEW_ENVIRON_VAL); APPEND_TEXT(mtts);
+    APPEND_BYTE(NEW_ENVIRON_VAR); APPEND_TEXT("TERMINAL_TYPE");
+    APPEND_BYTE(NEW_ENVIRON_VAL); APPEND_TEXT(terminal);
+
+#undef APPEND_TEXT
+#undef APPEND_BYTE
+
+    return send_subnegotiation(
+        state,
+        TELNET_OPT_NEW_ENVIRON,
+        payload,
+        used
+    );
+}
+
+static int charset_request_contains_utf8(
+    const unsigned char *payload,
+    size_t length
+)
+{
+    size_t i;
+
+    if (length < 3 || payload[0] != CHARSET_REQUEST) {
+        return 0;
+    }
+
+    for (i = 2; i + 5 <= length; ++i) {
+        if (strncasecmp((const char *)payload + i, "UTF-8", 5) == 0) {
+            return 1;
+        }
+    }
+
+    return 0;
 }
 
 static int maybe_request_utf8(struct client_state *state)
@@ -645,6 +728,40 @@ static int handle_subnegotiation(struct client_state *state)
 
     if (state->sub_option == TELNET_OPT_CHARSET &&
         state->sub_length >= 1) {
+        if (state->sub_data[0] == CHARSET_REQUEST &&
+            telnet_q_enabled(
+                &state->options,
+                TELNET_Q_REMOTE,
+                TELNET_OPT_CHARSET
+            )) {
+            if (charset_request_contains_utf8(
+                    state->sub_data,
+                    state->sub_length
+                )) {
+                const unsigned char accepted[] = {
+                    CHARSET_ACCEPTED,
+                    'U','T','F','-','8'
+                };
+                state->utf8_enabled = 1;
+                return send_subnegotiation(
+                    state,
+                    TELNET_OPT_CHARSET,
+                    accepted,
+                    sizeof(accepted)
+                );
+            }
+
+            {
+                const unsigned char rejected[] = {CHARSET_REJECTED};
+                return send_subnegotiation(
+                    state,
+                    TELNET_OPT_CHARSET,
+                    rejected,
+                    sizeof(rejected)
+                );
+            }
+        }
+
         if (state->sub_data[0] == CHARSET_ACCEPTED &&
             state->sub_length == 6 &&
             strncasecmp(
@@ -656,6 +773,17 @@ static int handle_subnegotiation(struct client_state *state)
         } else if (state->sub_data[0] == CHARSET_REJECTED) {
             state->utf8_enabled = 0;
         }
+    }
+
+    if (state->sub_option == TELNET_OPT_NEW_ENVIRON &&
+        state->sub_length >= 1 &&
+        state->sub_data[0] == NEW_ENVIRON_SEND &&
+        telnet_q_enabled(
+            &state->options,
+            TELNET_Q_LOCAL,
+            TELNET_OPT_NEW_ENVIRON
+        )) {
+        return send_new_environ(state);
     }
 
     return 0;
@@ -934,7 +1062,7 @@ static int connect_tls(SSL *ssl)
 int main(int argc, char **argv)
 {
     const char *certificate_path = "local_tls/server.crt";
-    const uint16_t port = 3333;
+    const uint16_t port = 3334;
     SSL_CTX *context = NULL;
     SSL *ssl = NULL;
     int socket_fd = -1;

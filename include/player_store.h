@@ -5,11 +5,13 @@
 #define PLAYER_STORE_H
 
 /*
- * Persistent player credentials.
+ * Persistent account credentials shared by transports.
  *
- * Name rules, password policy, Argon2id verifiers, private account files, atomic
- * writes, and hash upgrades live here. The Telnet layer doesn't need to know the
- * record format.
+ * Name rules, password policy, Argon2id verifiers, private account files,
+ * atomic writes, and hash upgrades live here. There is intentionally no TCP,
+ * TLS, Telnet, terminal, or game-world logic in this owner: Telnet today and a
+ * future SSH authenticator should be able to verify the same account without
+ * duplicating the credential format.
  */
 
 #include <stddef.h>

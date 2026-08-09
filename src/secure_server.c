@@ -4,10 +4,15 @@
 /*
  * secure_server.c
  *
- * Loopback TLS 1.3 listener and connection-worker lifecycle. The listener does
- * admission checks before TLS work. Each worker owns one socket, one SSL object,
- * and one Telnet session. Shared policy, storage, and logging live in the server
- * runtime until every worker has stopped.
+ * Transport owner for the standalone C MUD networking slice. This file owns
+ * listener sockets, TLS handshakes, worker lifecycle, transport I/O, and the
+ * deadlines that belong to a connection. Once a stream is established, raw
+ * bytes are fed into telnet_protocol.c; Telnet parsing does not belong here.
+ *
+ * Plain TCP and TLS 1.3 intentionally use separate ports but the same Telnet
+ * session and credential/security objects. That preserves basic MUD-client
+ * compatibility without creating parallel games or parallel login systems, and
+ * leaves a clean sibling slot for SSH later.
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -18,6 +23,7 @@
 #include <errno.h>
 #include <netinet/in.h>
 #include <pthread.h>
+#include <poll.h>
 #include <signal.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -62,15 +68,27 @@ struct server_runtime {
     int stopping;
 };
 
+enum connection_transport_kind {
+    CONNECTION_TRANSPORT_TELNET = 0,
+    CONNECTION_TRANSPORT_TELNET_TLS
+};
+
 /* Immutable connection data transferred to one detached worker thread. */
 struct worker_args {
     struct server_runtime *runtime;
     int client_fd;
+    enum connection_transport_kind transport;
     char peer[96];
 };
 
-/* Adapts Telnet output callbacks to bounded TLS writes. */
-struct tls_writer {
+/*
+ * Telnet writes through one callback regardless of the socket transport. This
+ * is intentionally small: SSH will later be its own terminal adapter rather
+ * than another branch inside the Telnet protocol parser.
+ */
+struct connection_writer {
+    enum connection_transport_kind transport;
+    int fd;
     SSL *ssl;
     audit_log *audit;
     const char *peer;
@@ -214,33 +232,43 @@ static void runtime_wait_for_workers(
     pthread_mutex_unlock(&runtime->mutex);
 }
 
-static void encrypted_write(
+static const char *transport_label(enum connection_transport_kind transport)
+{
+    return transport == CONNECTION_TRANSPORT_TELNET_TLS
+        ? "telnet-tls"
+        : "telnet";
+}
+
+static void connection_write(
     void *context,
     const unsigned char *data,
     size_t length
 )
 {
-    struct tls_writer *writer = context;
+    struct connection_writer *writer = context;
     size_t offset = 0;
+    uint64_t started;
 
-    if (writer == NULL ||
-        writer->ssl == NULL ||
-        writer->failed) {
+    if (writer == NULL || writer->failed) {
         return;
     }
 
-    {
-        uint64_t started = monotonic_milliseconds();
+    started = monotonic_milliseconds();
 
-        while (offset < length) {
+    while (offset < length) {
+        if (writer->transport == CONNECTION_TRANSPORT_TELNET_TLS) {
             size_t written = 0;
             int result;
             int error;
             int socket_errno;
 
+            if (writer->ssl == NULL) {
+                writer->failed = 1;
+                return;
+            }
+
             ERR_clear_error();
             errno = 0;
-
             result = SSL_write_ex(
                 writer->ssl,
                 data + offset,
@@ -249,38 +277,53 @@ static void encrypted_write(
             );
             socket_errno = errno;
 
-            if (result == 1) {
-                if (written == 0) {
-                    writer->failed = 1;
-                    return;
-                }
-
+            if (result == 1 && written > 0) {
                 offset += written;
                 continue;
             }
 
             error = SSL_get_error(writer->ssl, result);
-
             if (retryable_socket_error(error, socket_errno)) {
                 uint64_t now = monotonic_milliseconds();
-
-                if (started != 0 &&
-                    now != 0 &&
+                if (started != 0 && now != 0 &&
                     now - started < SOCKET_WRITE_TIMEOUT_MS) {
                     continue;
                 }
             }
+        } else {
+            ssize_t written;
 
-            writer->failed = 1;
-
-            audit_log_event(
-                writer->audit,
-                "tls_write_failure",
-                writer->peer,
-                "encrypted application write failed or timed out"
+            errno = 0;
+            written = send(
+                writer->fd,
+                data + offset,
+                length - offset,
+                0
             );
-            return;
+
+            if (written > 0) {
+                offset += (size_t)written;
+                continue;
+            }
+
+            if (written < 0 &&
+                (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) {
+                uint64_t now = monotonic_milliseconds();
+                if (started != 0 && now != 0 &&
+                    now - started < SOCKET_WRITE_TIMEOUT_MS) {
+                    continue;
+                }
+            }
         }
+
+        writer->failed = 1;
+        audit_log_event(
+            writer->audit,
+            "transport_write_failure",
+            writer->peer,
+            transport_label(writer->transport)
+        );
+        return;
     }
 }
 
@@ -542,10 +585,11 @@ static void *connection_worker(void *opaque)
     struct worker_args *args = opaque;
     struct server_runtime *runtime = args->runtime;
     int client_fd = args->client_fd;
+    enum connection_transport_kind transport = args->transport;
     char peer[96];
     SSL *ssl = NULL;
     telnet_session *session = NULL;
-    struct tls_writer writer;
+    struct connection_writer writer;
     uint64_t connected_at;
     uint64_t last_activity;
     int handshake_complete = 0;
@@ -555,6 +599,10 @@ static void *connection_worker(void *opaque)
     free(args);
 
     memset(&writer, 0, sizeof(writer));
+    writer.transport = transport;
+    writer.fd = client_fd;
+    writer.audit = runtime->audit;
+    writer.peer = peer;
 
     (void)set_socket_timeout(
         client_fd,
@@ -567,37 +615,43 @@ static void *connection_worker(void *opaque)
         SOCKET_READ_TICK_MS
     );
 
-    ssl = SSL_new(runtime->tls_context);
-    if (ssl == NULL) {
+    if (transport == CONNECTION_TRANSPORT_TELNET_TLS) {
+        ssl = SSL_new(runtime->tls_context);
+        if (ssl == NULL) {
+            audit_log_event(
+                runtime->audit,
+                "tls_allocation_failure",
+                peer,
+                "SSL_new failed"
+            );
+            goto cleanup;
+        }
+
+        if (SSL_set_fd(ssl, client_fd) != 1) {
+            audit_log_event(
+                runtime->audit,
+                "tls_socket_attach_failure",
+                peer,
+                "SSL_set_fd failed"
+            );
+            goto cleanup;
+        }
+
+        if (tls_accept_with_deadline(runtime, ssl, peer) != 0) {
+            fatal_tls_error = 1;
+            goto cleanup;
+        }
+
+        handshake_complete = 1;
+        writer.ssl = ssl;
+    } else {
         audit_log_event(
             runtime->audit,
-            "tls_allocation_failure",
+            "telnet_plain_connection",
             peer,
-            "SSL_new failed"
+            "unencrypted compatibility transport"
         );
-        goto cleanup;
     }
-
-    if (SSL_set_fd(ssl, client_fd) != 1) {
-        audit_log_event(
-            runtime->audit,
-            "tls_socket_attach_failure",
-            peer,
-            "SSL_set_fd failed"
-        );
-        goto cleanup;
-    }
-
-    if (tls_accept_with_deadline(
-            runtime,
-            ssl,
-            peer
-        ) != 0) {
-        fatal_tls_error = 1;
-        goto cleanup;
-    }
-
-    handshake_complete = 1;
 
     (void)set_socket_timeout(
         client_fd,
@@ -605,18 +659,16 @@ static void *connection_worker(void *opaque)
         SOCKET_WRITE_TIMEOUT_MS
     );
 
-    writer.ssl = ssl;
-    writer.audit = runtime->audit;
-    writer.peer = peer;
-
     {
         telnet_session_config config = {
             .store = runtime->store,
             .security = runtime->security,
             .audit = runtime->audit,
             .remote_id = peer,
-            .writer = encrypted_write,
-            .writer_context = &writer
+            .writer = connection_write,
+            .writer_context = &writer,
+            .transport_secure =
+                transport == CONNECTION_TRANSPORT_TELNET_TLS
         };
 
         session = telnet_session_create(&config);
@@ -642,9 +694,6 @@ static void *connection_worker(void *opaque)
         unsigned char buffer[4096];
         uint64_t now = monotonic_milliseconds();
         size_t received = 0;
-        int result;
-        int error;
-        int socket_errno;
 
         if (runtime_is_stopping(runtime)) {
             audit_log_event(
@@ -661,7 +710,7 @@ static void *connection_worker(void *opaque)
         }
 
         if (now - connected_at >= SESSION_MAX_MS) {
-            encrypted_write(
+            connection_write(
                 &writer,
                 (const unsigned char *)
                     "Maximum session time reached.\r\n",
@@ -679,10 +728,9 @@ static void *connection_worker(void *opaque)
 
         if (!telnet_session_is_in_game(session) &&
             now - connected_at >= LOGIN_TIMEOUT_MS) {
-            encrypted_write(
+            connection_write(
                 &writer,
-                (const unsigned char *)
-                    "Login timed out.\r\n",
+                (const unsigned char *)"Login timed out.\r\n",
                 strlen("Login timed out.\r\n")
             );
 
@@ -697,10 +745,9 @@ static void *connection_worker(void *opaque)
 
         if (telnet_session_is_in_game(session) &&
             now - last_activity >= IDLE_TIMEOUT_MS) {
-            encrypted_write(
+            connection_write(
                 &writer,
-                (const unsigned char *)
-                    "Idle timeout.\r\n",
+                (const unsigned char *)"Idle timeout.\r\n",
                 strlen("Idle timeout.\r\n")
             );
 
@@ -713,21 +760,68 @@ static void *connection_worker(void *opaque)
             break;
         }
 
-        ERR_clear_error();
-        errno = 0;
+        if (transport == CONNECTION_TRANSPORT_TELNET_TLS) {
+            int result;
+            int error;
+            int socket_errno;
 
-        result = SSL_read_ex(
-            ssl,
-            buffer,
-            sizeof(buffer),
-            &received
-        );
-        socket_errno = errno;
+            ERR_clear_error();
+            errno = 0;
+            result = SSL_read_ex(
+                ssl,
+                buffer,
+                sizeof(buffer),
+                &received
+            );
+            socket_errno = errno;
 
-        if (result == 1) {
-            if (received > 0) {
+            if (result == 1) {
+                if (received > 0) {
+                    last_activity = monotonic_milliseconds();
+                    if (telnet_session_feed_at(
+                            session,
+                            buffer,
+                            received,
+                            last_activity
+                        ) != 0) {
+                        break;
+                    }
+                }
+                continue;
+            }
+
+            error = SSL_get_error(ssl, result);
+            if (error == SSL_ERROR_ZERO_RETURN) {
+                audit_log_event(
+                    runtime->audit,
+                    "connection_close",
+                    peer,
+                    "peer sent TLS close_notify"
+                );
+                break;
+            }
+
+            if (retryable_socket_error(error, socket_errno)) {
+                continue;
+            }
+
+            fatal_tls_error = 1;
+            audit_log_event(
+                runtime->audit,
+                "tls_read_failure",
+                peer,
+                "fatal TLS read error or unclean disconnect"
+            );
+            break;
+        } else {
+            ssize_t result;
+
+            errno = 0;
+            result = recv(client_fd, buffer, sizeof(buffer), 0);
+
+            if (result > 0) {
+                received = (size_t)result;
                 last_activity = monotonic_milliseconds();
-
                 if (telnet_session_feed_at(
                         session,
                         buffer,
@@ -736,40 +830,31 @@ static void *connection_worker(void *opaque)
                     ) != 0) {
                     break;
                 }
+                continue;
             }
-            continue;
-        }
 
-        error = SSL_get_error(ssl, result);
+            if (result == 0) {
+                audit_log_event(
+                    runtime->audit,
+                    "connection_close",
+                    peer,
+                    "plain Telnet peer closed connection"
+                );
+                break;
+            }
 
-        if (error == SSL_ERROR_ZERO_RETURN) {
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+                continue;
+            }
+
             audit_log_event(
                 runtime->audit,
-                "connection_close",
+                "tcp_read_failure",
                 peer,
-                "peer sent TLS close_notify"
+                "plain Telnet socket read failed"
             );
             break;
         }
-
-        if (retryable_socket_error(error, socket_errno)) {
-            continue;
-        }
-
-        /*
-         * A fatal read can be a bad TLS record, a broken socket, or a peer that
-         * vanished without close_notify. Keep the audit event useful and keep
-         * the OpenSSL stack out of normal server output.
-         */
-        fatal_tls_error = 1;
-
-        audit_log_event(
-            runtime->audit,
-            "tls_read_failure",
-            peer,
-            "fatal TLS read error or unclean disconnect"
-        );
-        break;
     }
 
 cleanup:
@@ -825,6 +910,103 @@ static int peer_string(
     return 0;
 }
 
+static int accept_connection(
+    struct server_runtime *runtime,
+    int listener,
+    enum connection_transport_kind transport
+)
+{
+    struct sockaddr_in remote_address;
+    socklen_t remote_length = sizeof(remote_address);
+    struct worker_args *args;
+    pthread_t thread;
+    char peer[96];
+    uint64_t retry_ms = 0;
+    uint64_t now_ms;
+    int client_fd;
+
+    memset(&remote_address, 0, sizeof(remote_address));
+    client_fd = accept(
+        listener,
+        (struct sockaddr *)&remote_address,
+        &remote_length
+    );
+
+    if (client_fd < 0) {
+        if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+            return 0;
+        }
+        return -1;
+    }
+
+    if (peer_string(&remote_address, peer, sizeof(peer)) != 0) {
+        memcpy(peer, "unknown", sizeof("unknown"));
+    }
+
+    now_ms = monotonic_milliseconds();
+    if (now_ms == 0 ||
+        !security_policy_allow_connection(
+            runtime->security,
+            peer,
+            now_ms,
+            &retry_ms
+        )) {
+        audit_log_event(
+            runtime->audit,
+            "connection_rate_limited",
+            peer,
+            transport_label(transport)
+        );
+        close(client_fd);
+        return 0;
+    }
+
+    if (!runtime_reserve_connection(runtime)) {
+        audit_log_event(
+            runtime->audit,
+            "connection_capacity_reached",
+            peer,
+            "maximum active connections reached"
+        );
+        close(client_fd);
+        return 0;
+    }
+
+    args = calloc(1, sizeof(*args));
+    if (args == NULL) {
+        close(client_fd);
+        runtime_release_connection(runtime);
+        return 0;
+    }
+
+    args->runtime = runtime;
+    args->client_fd = client_fd;
+    args->transport = transport;
+    memcpy(args->peer, peer, strlen(peer) + 1);
+
+    if (pthread_create(
+            &thread,
+            NULL,
+            connection_worker,
+            args
+        ) != 0) {
+        free(args);
+        close(client_fd);
+        runtime_release_connection(runtime);
+
+        audit_log_event(
+            runtime->audit,
+            "worker_creation_failure",
+            peer,
+            "pthread_create failed"
+        );
+        return 0;
+    }
+
+    (void)pthread_detach(thread);
+    return 0;
+}
+
 int secure_server_run(const secure_server_config *config)
 {
     struct server_runtime runtime;
@@ -833,7 +1015,8 @@ int secure_server_run(const secure_server_config *config)
     player_store *store = NULL;
     security_policy *security = NULL;
     audit_log *audit = NULL;
-    int listener = -1;
+    int plain_listener = -1;
+    int tls_listener = -1;
     int exit_status = -1;
 
     memset(&runtime, 0, sizeof(runtime));
@@ -846,20 +1029,16 @@ int secure_server_run(const secure_server_config *config)
         config->private_key_path == NULL ||
         config->player_directory_path == NULL ||
         config->audit_log_path == NULL ||
-        config->port == 0) {
-        fprintf(stderr, "Invalid secure server configuration.\n");
+        config->telnet_port == 0 ||
+        config->telnet_tls_port == 0 ||
+        config->telnet_port == config->telnet_tls_port) {
+        fprintf(stderr, "Invalid server configuration.\n");
         return -1;
     }
 
-    /*
-     * Port 3333 doesn't need privilege. Running this process as root would only
-     * make a future parser or library bug hurt more.
-     */
+    /* High unprivileged ports let the server keep root out of the trust model. */
     if (geteuid() == 0) {
-        fprintf(
-            stderr,
-            "Refusing to run the server as root.\n"
-        );
+        fprintf(stderr, "Refusing to run the server as root.\n");
         return -1;
     }
 
@@ -909,8 +1088,13 @@ int secure_server_run(const secure_server_config *config)
         goto cleanup;
     }
 
-    listener = create_loopback_listener(config->port);
-    if (listener < 0) {
+    plain_listener = create_loopback_listener(config->telnet_port);
+    if (plain_listener < 0) {
+        goto cleanup;
+    }
+
+    tls_listener = create_loopback_listener(config->telnet_tls_port);
+    if (tls_listener < 0) {
         goto cleanup;
     }
 
@@ -923,135 +1107,106 @@ int secure_server_run(const secure_server_config *config)
         audit,
         "server_start",
         "local",
-        "TLS 1.3 loopback listener started"
+        "plain Telnet and TLS 1.3 Telnet listeners started"
     );
 
     fprintf(
         stdout,
-        "Encrypted listener ready on 127.0.0.1:%u using TLS 1.3.\n",
-        (unsigned int)config->port
+        "Plain Telnet compatibility listener ready on 127.0.0.1:%u.\n",
+        (unsigned int)config->telnet_port
     );
     fprintf(
         stdout,
-        "Security hardening active: concurrency, timeouts, "
-        "throttling, audit logging, and bounded Telnet parsing.\n"
+        "Encrypted Telnet listener ready on 127.0.0.1:%u using TLS 1.3.\n",
+        (unsigned int)config->telnet_tls_port
+    );
+    fprintf(
+        stdout,
+        "Both transports share one Telnet, login, policy, and player store.\n"
     );
     fflush(stdout);
 
     while (!stop_requested) {
-        struct sockaddr_in remote_address;
-        socklen_t remote_length = sizeof(remote_address);
-        char peer[96];
-        uint64_t retry_ms = 0;
-        uint64_t now_ms;
-        int client_fd;
+        struct pollfd listeners[2];
+        int result;
+        int i;
+        int fatal_listener_error = 0;
 
-        memset(&remote_address, 0, sizeof(remote_address));
+        memset(listeners, 0, sizeof(listeners));
+        listeners[0].fd = plain_listener;
+        listeners[0].events = POLLIN;
+        listeners[1].fd = tls_listener;
+        listeners[1].events = POLLIN;
 
-        client_fd = accept(
-            listener,
-            (struct sockaddr *)&remote_address,
-            &remote_length
-        );
-
-        if (client_fd < 0) {
+        result = poll(listeners, 2, 1000);
+        if (result < 0) {
             if (errno == EINTR) {
                 continue;
             }
-
-            perror("accept");
+            perror("poll");
             audit_log_event(
                 audit,
                 "listener_failure",
                 "local",
-                "accept failed"
+                "poll failed"
             );
             break;
         }
 
-        if (peer_string(
-                &remote_address,
-                peer,
-                sizeof(peer)
-            ) != 0) {
-            memcpy(peer, "unknown", sizeof("unknown"));
-        }
-
-        now_ms = monotonic_milliseconds();
-
-        if (now_ms == 0 ||
-            !security_policy_allow_connection(
-                security,
-                peer,
-                now_ms,
-                &retry_ms
-            )) {
-            audit_log_event(
-                audit,
-                "connection_rate_limited",
-                peer,
-                "connection dropped before TLS"
-            );
-            close(client_fd);
+        if (result == 0) {
             continue;
         }
 
-        if (!runtime_reserve_connection(&runtime)) {
-            audit_log_event(
-                audit,
-                "connection_capacity_reached",
-                peer,
-                "maximum active connections reached"
-            );
-            close(client_fd);
-            continue;
-        }
+        for (i = 0; i < 2; ++i) {
+            enum connection_transport_kind transport =
+                i == 0
+                    ? CONNECTION_TRANSPORT_TELNET
+                    : CONNECTION_TRANSPORT_TELNET_TLS;
 
-        {
-            struct worker_args *args =
-                calloc(1, sizeof(*args));
-            pthread_t thread;
-
-            if (args == NULL) {
-                close(client_fd);
-                runtime_release_connection(&runtime);
-                continue;
-            }
-
-            args->runtime = &runtime;
-            args->client_fd = client_fd;
-            memcpy(args->peer, peer, strlen(peer) + 1);
-
-            if (pthread_create(
-                    &thread,
-                    NULL,
-                    connection_worker,
-                    args
-                ) != 0) {
-                free(args);
-                close(client_fd);
-                runtime_release_connection(&runtime);
-
+            if (listeners[i].revents & (POLLERR | POLLHUP | POLLNVAL)) {
                 audit_log_event(
                     audit,
-                    "worker_creation_failure",
-                    peer,
-                    "pthread_create failed"
+                    "listener_failure",
+                    "local",
+                    transport_label(transport)
                 );
-                continue;
+                fatal_listener_error = 1;
+                break;
             }
 
-            (void)pthread_detach(thread);
+            if ((listeners[i].revents & POLLIN) != 0 &&
+                accept_connection(
+                    &runtime,
+                    listeners[i].fd,
+                    transport
+                ) != 0) {
+                perror("accept");
+                audit_log_event(
+                    audit,
+                    "listener_failure",
+                    "local",
+                    transport_label(transport)
+                );
+                fatal_listener_error = 1;
+                break;
+            }
+        }
+
+        if (fatal_listener_error) {
+            break;
         }
     }
 
     exit_status = stop_requested ? 0 : -1;
-
     runtime_begin_shutdown(&runtime);
 
-    if (listener >= 0) {
-        close(listener);
-        listener = -1;
+    if (plain_listener >= 0) {
+        close(plain_listener);
+        plain_listener = -1;
+    }
+    if (tls_listener >= 0) {
+        close(tls_listener);
+        tls_listener = -1;
     }
 
     runtime_wait_for_workers(&runtime);
@@ -1060,12 +1215,15 @@ int secure_server_run(const secure_server_config *config)
         audit,
         "server_stop",
         "local",
-        "listener stopped"
+        "listeners stopped"
     );
 
 cleanup:
-    if (listener >= 0) {
-        close(listener);
+    if (plain_listener >= 0) {
+        close(plain_listener);
+    }
+    if (tls_listener >= 0) {
+        close(tls_listener);
     }
 
     SSL_CTX_free(context);

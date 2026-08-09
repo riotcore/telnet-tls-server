@@ -43,9 +43,13 @@ enum telnet_option_code {
     TELNET_OPT_ECHO = 1,
     TELNET_OPT_SUPPRESS_GO_AHEAD = 3,
     TELNET_OPT_TERMINAL_TYPE = 24,
+    TELNET_OPT_END_OF_RECORD = 25,
     TELNET_OPT_NAWS = 31,
     TELNET_OPT_LINEMODE = 34,
-    TELNET_OPT_CHARSET = 42
+    TELNET_OPT_NEW_ENVIRON = 39,
+    TELNET_OPT_CHARSET = 42,
+    TELNET_OPT_MSSP = 70,
+    TELNET_OPT_GMCP = 201
 };
 
 typedef enum telnet_q_direction {

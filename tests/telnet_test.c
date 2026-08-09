@@ -498,14 +498,26 @@ static void test_operational_telnet(void)
     const unsigned char do_sga[] = {
         TELNET_IAC, TELNET_DO, TELNET_OPT_SUPPRESS_GO_AHEAD
     };
+    const unsigned char will_eor[] = {
+        TELNET_IAC, TELNET_WILL, TELNET_OPT_END_OF_RECORD
+    };
     const unsigned char do_naws[] = {
         TELNET_IAC, TELNET_DO, TELNET_OPT_NAWS
     };
     const unsigned char do_ttype[] = {
         TELNET_IAC, TELNET_DO, TELNET_OPT_TERMINAL_TYPE
     };
+    const unsigned char will_charset[] = {
+        TELNET_IAC, TELNET_WILL, TELNET_OPT_CHARSET
+    };
     const unsigned char do_charset[] = {
         TELNET_IAC, TELNET_DO, TELNET_OPT_CHARSET
+    };
+    const unsigned char do_new_environ[] = {
+        TELNET_IAC, TELNET_DO, TELNET_OPT_NEW_ENVIRON
+    };
+    const unsigned char ga[] = {
+        TELNET_IAC, TELNET_GA
     };
 
     fixture_open(&fixture, "/tmp/telnet-ops-test-XXXXXX");
@@ -524,20 +536,33 @@ static void test_operational_telnet(void)
     CHECK(capture_contains_bytes(&output, do_binary, sizeof(do_binary)));
     CHECK(capture_contains_bytes(&output, will_sga, sizeof(will_sga)));
     CHECK(capture_contains_bytes(&output, do_sga, sizeof(do_sga)));
+    CHECK(capture_contains_bytes(&output, will_eor, sizeof(will_eor)));
     CHECK(capture_contains_bytes(&output, do_naws, sizeof(do_naws)));
     CHECK(capture_contains_bytes(&output, do_ttype, sizeof(do_ttype)));
+    CHECK(capture_contains_bytes(&output, will_charset, sizeof(will_charset)));
     CHECK(capture_contains_bytes(&output, do_charset, sizeof(do_charset)));
+    CHECK(capture_contains_bytes(
+        &output,
+        do_new_environ,
+        sizeof(do_new_environ)
+    ));
+    /* Before SGA/EOR is agreed, the first prompt uses ordinary Telnet GA. */
+    CHECK(capture_contains_bytes(&output, ga, sizeof(ga)));
 
     /* Complete the server-initiated capability negotiations. */
+    clear_capture(&output);
     {
         const unsigned char replies[] = {
             TELNET_IAC, TELNET_DO, TELNET_OPT_BINARY,
             TELNET_IAC, TELNET_WILL, TELNET_OPT_BINARY,
             TELNET_IAC, TELNET_DO, TELNET_OPT_SUPPRESS_GO_AHEAD,
             TELNET_IAC, TELNET_WILL, TELNET_OPT_SUPPRESS_GO_AHEAD,
+            TELNET_IAC, TELNET_DO, TELNET_OPT_END_OF_RECORD,
             TELNET_IAC, TELNET_WILL, TELNET_OPT_NAWS,
             TELNET_IAC, TELNET_WILL, TELNET_OPT_TERMINAL_TYPE,
-            TELNET_IAC, TELNET_WILL, TELNET_OPT_CHARSET
+            TELNET_IAC, TELNET_DO, TELNET_OPT_CHARSET,
+            TELNET_IAC, TELNET_WILL, TELNET_OPT_CHARSET,
+            TELNET_IAC, TELNET_WILL, TELNET_OPT_NEW_ENVIRON
         };
 
         CHECK(telnet_session_feed_at(
@@ -550,21 +575,79 @@ static void test_operational_telnet(void)
 
     {
         const unsigned char ttype_send[] = {
-            TELNET_IAC,
-            TELNET_SB,
-            TELNET_OPT_TERMINAL_TYPE,
-            1,
-            TELNET_IAC,
-            TELNET_SE
+            TELNET_IAC, TELNET_SB, TELNET_OPT_TERMINAL_TYPE,
+            1, TELNET_IAC, TELNET_SE
         };
+        const unsigned char charset_request[] = {
+            TELNET_IAC, TELNET_SB, TELNET_OPT_CHARSET,
+            1, ';', 'U', 'T', 'F', '-', '8',
+            TELNET_IAC, TELNET_SE
+        };
+        const unsigned char environ_request_prefix[] = {
+            TELNET_IAC, TELNET_SB, TELNET_OPT_NEW_ENVIRON,
+            1, 0, 'C', 'L', 'I', 'E', 'N', 'T', '_', 'N', 'A', 'M', 'E'
+        };
+
         CHECK(capture_contains_bytes(
             &output,
             ttype_send,
             sizeof(ttype_send)
         ));
+        CHECK(capture_contains_bytes(
+            &output,
+            charset_request,
+            sizeof(charset_request)
+        ));
+        CHECK(capture_contains_bytes(
+            &output,
+            environ_request_prefix,
+            sizeof(environ_request_prefix)
+        ));
     }
 
-    clear_capture(&output);
+    /* MTTS discovery is deliberately bounded to the standard four responses. */
+    {
+        const unsigned char reports[][32] = {
+            {TELNET_IAC, TELNET_SB, TELNET_OPT_TERMINAL_TYPE,
+             0, 'M','U','D','L','E','T', TELNET_IAC, TELNET_SE},
+            {TELNET_IAC, TELNET_SB, TELNET_OPT_TERMINAL_TYPE,
+             0, 'X','T','E','R','M', TELNET_IAC, TELNET_SE},
+            {TELNET_IAC, TELNET_SB, TELNET_OPT_TERMINAL_TYPE,
+             0, 'M','T','T','S',' ','8','4','7', TELNET_IAC, TELNET_SE},
+            {TELNET_IAC, TELNET_SB, TELNET_OPT_TERMINAL_TYPE,
+             0, 'M','T','T','S',' ','8','4','7', TELNET_IAC, TELNET_SE}
+        };
+        const size_t report_lengths[] = {12, 11, 14, 14};
+        const unsigned char ttype_send[] = {
+            TELNET_IAC, TELNET_SB, TELNET_OPT_TERMINAL_TYPE,
+            1, TELNET_IAC, TELNET_SE
+        };
+        size_t i;
+
+        for (i = 0; i < 4; ++i) {
+            clear_capture(&output);
+            CHECK(telnet_session_feed_at(
+                session,
+                reports[i],
+                report_lengths[i],
+                1100 + (uint64_t)i
+            ) == 0);
+
+            if (i < 3) {
+                CHECK(capture_contains_bytes(
+                    &output,
+                    ttype_send,
+                    sizeof(ttype_send)
+                ));
+            } else {
+                CHECK(!capture_contains_bytes(
+                    &output,
+                    ttype_send,
+                    sizeof(ttype_send)
+                ));
+            }
+        }
+    }
 
     /* Report a 120-column by 40-row terminal. */
     {
@@ -577,35 +660,66 @@ static void test_operational_telnet(void)
             session,
             naws,
             sizeof(naws),
-            1100
-        ) == 0);
-    }
-
-    {
-        const unsigned char ttype[] = {
-            TELNET_IAC, TELNET_SB, TELNET_OPT_TERMINAL_TYPE,
-            0, 'X', 'T', 'E', 'R', 'M',
-            TELNET_IAC, TELNET_SE
-        };
-        CHECK(telnet_session_feed_at(
-            session,
-            ttype,
-            sizeof(ttype),
             1200
         ) == 0);
     }
 
+    /* Accept the server-originated UTF-8 request. */
     {
-        const unsigned char charset[] = {
+        const unsigned char charset_accepted[] = {
             TELNET_IAC, TELNET_SB, TELNET_OPT_CHARSET,
-            1, ';', 'U', 'T', 'F', '-', '8',
+            2, 'U', 'T', 'F', '-', '8',
             TELNET_IAC, TELNET_SE
         };
         CHECK(telnet_session_feed_at(
             session,
-            charset,
-            sizeof(charset),
+            charset_accepted,
+            sizeof(charset_accepted),
             1300
+        ) == 0);
+    }
+
+    /* The opposite RFC 2066 role remains supported too. */
+    clear_capture(&output);
+    {
+        const unsigned char charset_request[] = {
+            TELNET_IAC, TELNET_SB, TELNET_OPT_CHARSET,
+            1, ';', 'U', 'T', 'F', '-', '8',
+            TELNET_IAC, TELNET_SE
+        };
+        const unsigned char accepted[] = {
+            TELNET_IAC, TELNET_SB, TELNET_OPT_CHARSET,
+            2, 'U', 'T', 'F', '-', '8',
+            TELNET_IAC, TELNET_SE
+        };
+
+        CHECK(telnet_session_feed_at(
+            session,
+            charset_request,
+            sizeof(charset_request),
+            1301
+        ) == 0);
+        CHECK(capture_contains_bytes(&output, accepted, sizeof(accepted)));
+    }
+
+    /* MNES can fill/update client metadata independently of TTYPE. */
+    {
+        const unsigned char environ[] = {
+            TELNET_IAC, TELNET_SB, TELNET_OPT_NEW_ENVIRON,
+            0,
+            /* Unknown variables and RFC 1572 escaping must not desync parsing. */
+            0, 'X', 1, 'A', 2, 1, 'B',
+            0, 'C','L','I','E','N','T','_','N','A','M','E',
+            1, 'M','u','d','l','e','t',
+            0, 'C','L','I','E','N','T','_','V','E','R','S','I','O','N',
+            1, '4','.','1','9',
+            TELNET_IAC, TELNET_SE
+        };
+        CHECK(telnet_session_feed_at(
+            session,
+            environ,
+            sizeof(environ),
+            1350
         ) == 0);
     }
 
@@ -616,13 +730,26 @@ static void test_operational_telnet(void)
     CHECK(info.remote_binary);
     CHECK(info.local_suppress_go_ahead);
     CHECK(info.remote_suppress_go_ahead);
+    CHECK(info.local_eor);
+    CHECK(info.new_environ);
     CHECK(info.utf8_enabled);
+    CHECK(info.ansi);
+    CHECK(info.vt100);
+    CHECK(info.color_256);
+    CHECK(info.truecolor);
+    CHECK(info.screen_reader);
+    CHECK(info.mnes);
+    CHECK(info.mtts_flags == 847U);
     CHECK(strcmp(info.terminal_type, "XTERM") == 0);
+    CHECK(strcmp(info.client_name, "Mudlet") == 0);
+    CHECK(strcmp(info.client_version, "4.19") == 0);
 
-    /* AYT produces a protocol response and leaves line input untouched. */
+    /* AYT produces a prompt response and EOR marks that prompt boundary. */
     clear_capture(&output);
     {
         const unsigned char ayt[] = {TELNET_IAC, TELNET_AYT};
+        const unsigned char eor[] = {TELNET_IAC, TELNET_EOR};
+        const unsigned char prompt_ga[] = {TELNET_IAC, TELNET_GA};
         CHECK(telnet_session_feed_at(
             session,
             ayt,
@@ -630,6 +757,8 @@ static void test_operational_telnet(void)
             1400
         ) == 0);
         CHECK(capture_contains_text(&output, "Server is here"));
+        CHECK(capture_contains_bytes(&output, eor, sizeof(eor)));
+        CHECK(!capture_contains_bytes(&output, prompt_ga, sizeof(prompt_ga)));
     }
 
     /* CR is held until the following NVT byte defines its meaning. */
@@ -741,6 +870,34 @@ static void test_old_client_controls(void)
     fixture_close(&fixture, NULL);
 }
 
+static void test_plain_telnet_warning(void)
+{
+    struct fixture fixture;
+    struct output_capture output = {0};
+    telnet_session *session;
+
+    fixture_open(&fixture, "/tmp/telnet-plain-warning-test-XXXXXX");
+    session = make_session(
+        &fixture,
+        "127.0.0.1",
+        capture_write,
+        &output
+    );
+    CHECK(session != NULL);
+
+    telnet_session_start(session);
+    clear_capture(&output);
+    feed_text(session, "TestUser\r\n", 1850);
+    CHECK(capture_contains_text(&output, "plain Telnet is not encrypted"));
+
+    clear_capture(&output);
+    feed_text(session, "12345678\r\n", 1851);
+    CHECK(!capture_contains_text(&output, "plain Telnet is not encrypted"));
+
+    telnet_session_destroy(session);
+    fixture_close(&fixture, NULL);
+}
+
 static void test_new_account_name_limit(void)
 {
     struct fixture fixture;
@@ -819,6 +976,44 @@ static void test_malformed_input(void)
         }
     }
 
+    /* Unknown but well-framed Telnet commands are compatibility noise, not abuse. */
+    {
+        const unsigned char unknown_command[] = {
+            TELNET_IAC, 200
+        };
+        unsigned int i;
+
+        for (i = 0; i < 20; ++i) {
+            CHECK(telnet_session_feed_at(
+                session,
+                unknown_command,
+                sizeof(unknown_command),
+                850000 + i
+            ) == 0);
+        }
+        CHECK(!telnet_session_should_close(session));
+    }
+
+    /* Eager NAWS reports before WILL NAWS are harmless and ignored. */
+    {
+        const unsigned char early_naws[] = {
+            TELNET_IAC, TELNET_SB, TELNET_OPT_NAWS,
+            0, 100, 0, 30,
+            TELNET_IAC, TELNET_SE
+        };
+        unsigned int i;
+
+        for (i = 0; i < 12; ++i) {
+            CHECK(telnet_session_feed_at(
+                session,
+                early_naws,
+                sizeof(early_naws),
+                860000 + i
+            ) == 0);
+        }
+        CHECK(!telnet_session_should_close(session));
+    }
+
     /* Repeated unsupported WILL requests remain bounded and stable. */
     {
         const unsigned char will_unknown[] = {
@@ -882,6 +1077,7 @@ int main(void)
     test_login_and_commands();
     test_operational_telnet();
     test_old_client_controls();
+    test_plain_telnet_warning();
     test_new_account_name_limit();
     test_malformed_input();
 

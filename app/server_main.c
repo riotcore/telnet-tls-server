@@ -4,8 +4,11 @@
 /*
  * server_main.c
  *
- * Tiny executable entry point. The library owns the server behavior; this file
- * only supplies paths, the development port, and process exit status.
+ * Local executable harness, not the intended MUD architecture. The reusable
+ * connection code lives in telnetcore; this file only supplies development
+ * paths/ports and starts it. An integrating C MUD would normally replace this
+ * entry point with its own configuration, process lifecycle, and game startup.
+ * Plain Telnet and TLS Telnet still reach the same account/session path.
  */
 
 #include <stdlib.h>
@@ -20,7 +23,8 @@ int main(int argc, char **argv)
         .private_key_path = "local_tls/server.key",
         .player_directory_path = "data/players",
         .audit_log_path = "logs/security.log",
-        .port = 3333
+        .telnet_port = 3333,
+        .telnet_tls_port = 3334
     };
 
     /* Optional paths make local certificate swaps painless. */

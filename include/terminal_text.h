@@ -5,11 +5,14 @@
 #define TERMINAL_TEXT_H
 
 /*
- * Terminal-safe text validation and sanitization.
+ * Transport-independent terminal-safe text validation and sanitization.
  *
- * Anything untrusted that may reach a user's terminal should pass through here.
- * ANSI escapes, Telnet command bytes, unsafe controls, malformed UTF-8, and a
- * small set of Unicode display controls are filtered.
+ * Anything untrusted that may reach a user's terminal should pass through this
+ * boundary before presentation. It is deliberately separate from the Telnet
+ * parser because the same player-authored text will eventually be rendered to
+ * Telnet, TLS Telnet, SSH, and possibly other terminal transports. ANSI escapes,
+ * Telnet command bytes, unsafe controls, malformed UTF-8, and selected Unicode
+ * display controls are filtered here rather than trusted to every caller.
  */
 
 #include <stddef.h>

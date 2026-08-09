@@ -5,11 +5,17 @@
 #define SECURITY_POLICY_H
 
 /*
- * Shared abuse-control policy.
+ * Shared cross-connection abuse-control policy.
  *
- * Connection workers share one policy object. Its mutex protects peer/account
- * records and global windows. Timestamps are monotonic milliseconds supplied by
- * the caller. Destroy it after all workers have stopped using it.
+ * This owner sits outside an individual Telnet session because peer/account
+ * backoff must survive connection replacement and must be shared by the plain
+ * and TLS listeners. Otherwise a client could bypass policy simply by changing
+ * ports. Session-local byte/line/command ceilings remain in telnet_protocol;
+ * this object owns the policy that spans workers and transports.
+ *
+ * Its mutex protects peer/account records and global windows. Timestamps are
+ * monotonic milliseconds supplied by the caller. Destroy it only after all
+ * workers have stopped using it.
  */
 
 #include <stdint.h>

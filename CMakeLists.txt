@@ -11,6 +11,9 @@ pkg_check_modules(SODIUM REQUIRED IMPORTED_TARGET libsodium)
 find_package(OpenSSL 1.1.1 REQUIRED)
 find_package(Threads REQUIRED)
 
+# telnetcore is the reusable C MUD connection slice. The telnet_server target
+# below is only a local harness; game/world ownership is intentionally outside
+# this library boundary.
 add_library(telnetcore STATIC
     src/audit_log.c
     src/security_policy.c

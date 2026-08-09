@@ -5,11 +5,21 @@
 #define TELNET_PROTOCOL_H
 
 /*
- * Application-facing Telnet session API.
+ * Application-facing Telnet adapter for a C MUD server.
  *
- * Raw Telnet parsing, negotiation, login state, input limits, and terminal
- * capabilities stay behind this interface. Higher-level code shouldn't need to
- * know what an IAC byte is.
+ * Raw Telnet framing, NVT input rules, option negotiation, subnegotiation,
+ * session-local input limits, and negotiated terminal capabilities stay behind
+ * this interface. Socket/TLS ownership stays in secure_server; credential
+ * storage stays in player_store; cross-connection abuse policy stays in
+ * security_policy. Keeping those concerns separate makes the Telnet adapter
+ * reusable when the surrounding game architecture changes.
+ *
+ * This standalone repository currently keeps a minimal account/login and
+ * command loop in the Telnet session so the public slice can run and be tested
+ * by itself. A complete MUD should eventually place account/game-session
+ * ownership above this adapter, which is the same seam a future SSH transport
+ * will use. Higher layers should consume negotiated capabilities rather than
+ * branch on a particular MUD client name.
  */
 
 #include <stddef.h>
@@ -24,6 +34,24 @@ extern "C" {
 #endif
 
 #define TELNET_TERMINAL_TYPE_MAX 40
+#define TELNET_CLIENT_NAME_MAX 40
+#define TELNET_CLIENT_VERSION_MAX 40
+
+/* MTTS bit values are exposed so presentation code can make capability choices. */
+enum telnet_mtts_capability {
+    TELNET_MTTS_ANSI = 1U,
+    TELNET_MTTS_VT100 = 2U,
+    TELNET_MTTS_UTF8 = 4U,
+    TELNET_MTTS_256_COLORS = 8U,
+    TELNET_MTTS_MOUSE_TRACKING = 16U,
+    TELNET_MTTS_OSC_COLOR_PALETTE = 32U,
+    TELNET_MTTS_SCREEN_READER = 64U,
+    TELNET_MTTS_PROXY = 128U,
+    TELNET_MTTS_TRUECOLOR = 256U,
+    TELNET_MTTS_MNES = 512U,
+    TELNET_MTTS_MSLP = 1024U,
+    TELNET_MTTS_TLS = 2048U
+};
 
 typedef void (*telnet_write_fn)(
     void *context,
@@ -40,18 +68,40 @@ typedef struct telnet_session_config {
     const char *remote_id;
     telnet_write_fn writer;
     void *writer_context;
+
+    /* Used only for security-aware presentation; Telnet itself is unchanged. */
+    int transport_secure;
 } telnet_session_config;
 
-/* Negotiated terminal capabilities exposed to future application systems. */
+/*
+ * Negotiated/reported terminal capabilities exposed to future application
+ * systems. Defaults remain conservative so a client that negotiates nothing is
+ * still fully usable as a basic line-oriented terminal.
+ */
 typedef struct telnet_terminal_info {
     uint16_t width;
     uint16_t height;
+
     int local_binary;
     int remote_binary;
     int local_suppress_go_ahead;
     int remote_suppress_go_ahead;
+    int local_eor;
+    int new_environ;
     int utf8_enabled;
+    int secure_transport;
+
+    uint32_t mtts_flags;
+    int ansi;
+    int vt100;
+    int color_256;
+    int truecolor;
+    int screen_reader;
+    int mnes;
+
     char terminal_type[TELNET_TERMINAL_TYPE_MAX + 1];
+    char client_name[TELNET_CLIENT_NAME_MAX + 1];
+    char client_version[TELNET_CLIENT_VERSION_MAX + 1];
 } telnet_terminal_info;
 
 /* Initializes protocol dependencies. Safe to call more than once. */
@@ -69,8 +119,9 @@ telnet_session *telnet_session_create(
 void telnet_session_destroy(telnet_session *session);
 
 /*
- * Starts capability negotiation and writes the welcome banner.
- * The call is idempotent for a session.
+ * Starts capability negotiation and writes the welcome banner. Negotiation is
+ * deliberately asynchronous: a peer can ignore every optional Telnet feature
+ * and still continue directly to the login prompt.
  */
 void telnet_session_start(telnet_session *session);
 
@@ -101,7 +152,8 @@ const char *telnet_session_player_name(const telnet_session *session);
 
 /*
  * Copies terminal metadata into caller-owned storage.
- * Defaults are 80x24, terminal type UNKNOWN, and UTF-8 disabled.
+ * Defaults are 80x24, terminal/client type UNKNOWN, and optional capabilities
+ * disabled until the peer negotiates or reports them.
  */
 void telnet_session_get_terminal_info(
     const telnet_session *session,

@@ -4,9 +4,11 @@
 /*
  * telnet_negotiation.c
  *
- * RFC 1143 option negotiation lives here. Each direction has its own state,
- * and the queue bit remembers when we change our mind mid-negotiation. That
- * little bit of bookkeeping keeps Telnet from arguing with itself forever.
+ * RFC 1143 option-state owner. Byte framing and subnegotiation parsing live in
+ * telnet_protocol.c; this file only answers the independent question "what
+ * state is option X in for each direction?" Keeping the Q-method separate makes
+ * negotiation loops and crossed WILL/DO transitions testable without sockets,
+ * TLS, login state, or MUD application code involved.
  */
 
 #include "telnet_internal.h"
