@@ -537,6 +537,11 @@ ssh -p 3335 AccountName@127.0.0.1
 The SSH endpoint is an application terminal, so commands such as SFTP, remote
 `exec`, or port forwarding are intentionally not available.
 
+Once authenticated through Telnet, Telnet/TLS, or SSH, the reference harness
+accepts a small command set. `PING` replies with `PONG`, `HELP` lists the
+available commands, and `QUIT` closes the client session cleanly without
+stopping the server. Command names are case-insensitive.
+
 Account records are created under `data/players/` and security audit output
 under `logs/`.
 

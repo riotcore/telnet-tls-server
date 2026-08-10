@@ -408,6 +408,7 @@ static void test_login_and_commands(void)
     clear_capture(&first_output);
     feed_text(first, "R!ot2026\r\n", 1300);
     CHECK(telnet_session_is_in_game(first));
+    CHECK(capture_contains_text(&first_output, "QUIT to disconnect"));
 
     clear_capture(&first_output);
     feed_text(first, "PING\r\n", 1400);
@@ -435,6 +436,20 @@ static void test_login_and_commands(void)
     clear_capture(&second_output);
     feed_text(second, "R!ot2026\r\n", 2100);
     CHECK(telnet_session_is_in_game(second));
+
+    clear_capture(&second_output);
+    feed_text(second, "hElP\r\n", 2200);
+    CHECK(capture_contains_text(&second_output, "HELP, PING, QUIT"));
+
+    clear_capture(&second_output);
+    CHECK(telnet_session_feed_at(
+        second,
+        (const unsigned char *)"qUiT\r\n",
+        strlen("qUiT\r\n"),
+        2300
+    ) == -1);
+    CHECK(capture_contains_text(&second_output, "Goodbye."));
+    CHECK(telnet_session_should_close(second));
     telnet_session_destroy(second);
 
     third = make_session(

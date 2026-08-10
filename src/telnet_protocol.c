@@ -1435,7 +1435,7 @@ static void enter_game(telnet_session *session)
     write_text(
         session,
         ". You are now in game.\r\n"
-        "Type PING to test the command loop.\r\n"
+        "Type PING to test the session, HELP for commands, or QUIT to disconnect.\r\n"
     );
     write_prompt_text(session, "> ");
 }
@@ -1781,6 +1781,17 @@ static void process_command(
     if (ascii_equal_ignore_case(session->line, "PING")) {
         write_text(session, "PONG\r\n");
         write_prompt_text(session, "> ");
+        return;
+    }
+
+    if (ascii_equal_ignore_case(session->line, "HELP")) {
+        write_text(session, "Commands: HELP, PING, QUIT\r\n");
+        write_prompt_text(session, "> ");
+        return;
+    }
+
+    if (ascii_equal_ignore_case(session->line, "QUIT")) {
+        request_close(session, "client_quit", "Goodbye.\r\n");
         return;
     }
 

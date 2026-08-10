@@ -100,7 +100,7 @@ static void *application_open(
         session->output.write_text(
             session->output.context,
             "\nAuthenticated terminal session.\n"
-            "Type HELP for the small reference-harness command set.\n"
+            "Type PING to test the session, HELP for commands, or QUIT to disconnect.\n"
         );
     }
     write_prompt(session);

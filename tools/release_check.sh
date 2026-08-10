@@ -358,6 +358,7 @@ wait_for(b"Confirm password:")
 send_line(password)
 
 wait_for(b"Authenticated terminal session.")
+wait_for(b"QUIT to disconnect.")
 
 send_line(b"PING")
 wait_for(b"PONG")
@@ -411,7 +412,8 @@ set -e
 
 if ! grep -Fq "PONG" "$RUNTIME/ssh.out" ||
    ! grep -Fq "$SMOKE_USER" "$RUNTIME/ssh.out" ||
-   ! grep -Fq "Authenticated terminal session." "$RUNTIME/ssh.out"
+   ! grep -Fq "Authenticated terminal session." "$RUNTIME/ssh.out" ||
+   ! grep -Fq "QUIT to disconnect." "$RUNTIME/ssh.out"
 then
     cat "$RUNTIME/ssh.out" >&2
     printf 'ssh client exit status: %s\n' "$SSH_STATUS" >&2
