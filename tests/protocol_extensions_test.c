@@ -31,6 +31,7 @@ struct application_probe {
     int link_result;
     int send_link_result;
     int gmcp_result;
+    int poll_calls;
     size_t gmcp_count;
     char gmcp_packages[4][64];
     char gmcp_payloads[4][256];
@@ -107,6 +108,13 @@ static void application_gmcp(
     memcpy(probe->gmcp_payloads[index], json_payload, json_length);
     probe->gmcp_payloads[index][json_length] = '\0';
     ++probe->gmcp_count;
+}
+
+static int application_poll(void *session_context)
+{
+    struct application_probe *probe = session_context;
+    ++probe->poll_calls;
+    return 0;
 }
 
 static void application_close(void *session_context)
@@ -189,6 +197,7 @@ int main(void)
     application.line = application_line;
     application.capabilities_changed = application_capabilities_changed;
     application.gmcp = application_gmcp;
+    application.poll = application_poll;
     application.close = application_close;
 
     memset(&capture, 0, sizeof(capture));
@@ -335,6 +344,8 @@ int main(void)
     ) == 0);
     CHECK(strcmp(probe.gmcp_packages[1], "Core.Supports.Set") == 0);
     CHECK(strcmp(probe.gmcp_payloads[1], "[\"Core 1\",\"Room 1\"]") == 0);
+    CHECK(telnet_session_poll(session) == 0);
+    CHECK(probe.poll_calls == 1);
 
     {
         static const unsigned char link_frame[] =

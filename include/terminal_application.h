@@ -113,6 +113,13 @@ typedef struct terminal_application_hooks {
         size_t json_length
     );
 
+    /*
+     * Runs only from the connection's owning worker thread. Applications can
+     * drain queued asynchronous output here without writing another session's
+     * socket, TLS object, or SSH channel from a publisher thread.
+     */
+    int (*poll)(void *session_context);
+
     void (*close)(void *session_context);
 } terminal_application_hooks;
 

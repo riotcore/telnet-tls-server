@@ -3133,6 +3133,22 @@ int telnet_session_feed(
     );
 }
 
+int telnet_session_poll(telnet_session *session)
+{
+    if (session == NULL || session->close_requested) {
+        return -1;
+    }
+
+    if (session->application_session != NULL &&
+        session->application.poll != NULL &&
+        session->application.poll(session->application_session) != 0) {
+        request_close(session, "application_poll_close", NULL);
+        return -1;
+    }
+
+    return session->close_requested ? -1 : 0;
+}
+
 int telnet_session_is_in_game(const telnet_session *session)
 {
     return session != NULL && session->login == LOGIN_IN_GAME;

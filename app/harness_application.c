@@ -227,6 +227,12 @@ static void application_gmcp(
     (void)json_length;
 }
 
+static int application_poll(void *session_context)
+{
+    (void)session_context;
+    return 0;
+}
+
 static void application_close(void *session_context)
 {
     free(session_context);
@@ -240,6 +246,7 @@ const terminal_application_hooks *harness_application_hooks(void)
         .line = application_line,
         .capabilities_changed = application_capabilities_changed,
         .gmcp = application_gmcp,
+        .poll = application_poll,
         .close = application_close
     };
 

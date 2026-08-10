@@ -173,6 +173,9 @@ int telnet_session_feed(
     size_t length
 );
 
+/* Drains transport-neutral application work on this connection's owner thread. */
+int telnet_session_poll(telnet_session *session);
+
 /* Session state queries used by transport code and the application seam. */
 int telnet_session_is_in_game(const telnet_session *session);
 int telnet_session_should_close(const telnet_session *session);

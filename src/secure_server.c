@@ -56,7 +56,7 @@
 #define IDLE_TIMEOUT_MS 900000ULL
 #define SESSION_MAX_MS (12ULL * 60ULL * 60ULL * 1000ULL)
 #define TLS_SHUTDOWN_TIMEOUT_MS 3000ULL
-#define SOCKET_READ_TICK_MS 1000U
+#define SOCKET_READ_TICK_MS 250U
 #define SOCKET_WRITE_TIMEOUT_MS 10000U
 #define MAX_LISTENER_SOCKETS 6U
 #define LISTENER_UNAVAILABLE (-2)
@@ -875,6 +875,10 @@ static void *connection_worker(void *opaque)
                 peer,
                 "idle session closed"
             );
+            break;
+        }
+
+        if (telnet_session_poll(session) != 0) {
             break;
         }
 

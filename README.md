@@ -255,6 +255,10 @@ features it recognizes. Rich client-specific UI belongs above this layer.
 
 ## Shared terminal application seam
 
+### Owner-thread application polling
+
+`terminal_application_hooks.poll` is an optional post-authentication callback. Telnet, Telnet/TLS, and SSH invoke it only from the connection's owning worker thread. An application can therefore drain queued asynchronous output without a publisher thread writing another session's socket, TLS object, or SSH channel. The reference workers check for queued application work on a 250 ms cadence.
+
 `include/terminal_application.h` is the transport/application handoff.
 
 The application receives a `terminal_capabilities` snapshot with terminal

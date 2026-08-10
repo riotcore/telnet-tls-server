@@ -41,7 +41,7 @@
 #define SSH_AUTH_TIMEOUT_MS 120000ULL
 #define SSH_IDLE_TIMEOUT_MS 900000ULL
 #define SSH_SESSION_MAX_MS (12ULL * 60ULL * 60ULL * 1000ULL)
-#define SSH_EVENT_TICK_MS 1000
+#define SSH_EVENT_TICK_MS 250
 #define SSH_WRITE_CHUNK_MAX 16384U
 
 struct rate_window {
@@ -1229,6 +1229,14 @@ int ssh_transport_run_connection(
                 "ssh_idle_timeout",
                 "session idle timeout"
             );
+            break;
+        }
+
+        if (connection.shell_started &&
+            connection.application_session != NULL &&
+            connection.application.poll != NULL &&
+            connection.application.poll(connection.application_session) != 0) {
+            connection.close_requested = 1;
             break;
         }
 
