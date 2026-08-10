@@ -7,11 +7,9 @@
 /*
  * Shared cross-connection abuse-control policy.
  *
- * This owner sits outside an individual Telnet session because peer/account
- * backoff must survive connection replacement and must be shared by the plain
- * and TLS listeners. Otherwise a client could bypass policy simply by changing
- * ports. Session-local byte/line/command ceilings remain in telnet_protocol;
- * this object owns the policy that spans workers and transports.
+ * Peer and account backoff is shared across plain Telnet, TLS Telnet, and SSH
+ * so reconnecting or changing ports does not bypass it. Session-local byte,
+ * line, and command limits remain in their protocol adapters.
  *
  * Its mutex protects peer/account records and global windows. Timestamps are
  * monotonic milliseconds supplied by the caller. Destroy it only after all
@@ -33,7 +31,7 @@ security_policy *security_policy_create(void);
 void security_policy_destroy(security_policy *policy);
 
 /*
- * Checks peer and global connection-start windows before TLS work begins.
+ * Checks peer and global connection-start windows before expensive handshakes.
  *
  * Returns 1 when accepted and 0 when delayed. retry_after_ms may be NULL.
  */

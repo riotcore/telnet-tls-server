@@ -1044,12 +1044,12 @@ static void test_malformed_input(void)
     CHECK(session != NULL);
     telnet_session_start(session);
 
-    /* The fixed subnegotiation cap closes a session that exceeds 256 bytes. */
+    /* The fixed subnegotiation cap closes a session that exceeds 4096 bytes. */
     {
         const unsigned char prefix[] = {
             TELNET_IAC, TELNET_SB, TELNET_OPT_CHARSET
         };
-        unsigned char payload[257];
+        unsigned char payload[4097];
 
         memset(payload, 'A', sizeof(payload));
 

@@ -4,15 +4,15 @@
 /*
  * secure_server.c
  *
- * Transport owner for the standalone C MUD networking slice. This file owns
- * listener sockets, TLS handshakes, worker lifecycle, transport I/O, and the
- * deadlines that belong to a connection. Once a stream is established, raw
- * bytes are fed into telnet_protocol.c; Telnet parsing does not belong here.
+ * The accept loop lives here because transport admission is one policy even
+ * when the wire protocols differ. It polls the small listener set, applies the
+ * shared peer/connection limits, then hands each accepted socket to one bounded
+ * worker. A slow client therefore blocks its own worker, not accept() for every
+ * other player.
  *
- * Plain TCP and TLS 1.3 intentionally use separate ports but the same Telnet
- * session and credential/security objects. That preserves basic MUD-client
- * compatibility without creating parallel games or parallel login systems, and
- * leaves a clean sibling slot for SSH later.
+ * Plain TCP and TLS both feed the Telnet adapter. SSH takes a different route:
+ * libssh owns its handshake and channel protocol. After authentication, SSH
+ * and Telnet both hand the session to the same terminal_application hooks.
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -44,8 +44,12 @@
 #include "player_store.h"
 #include "security_policy.h"
 #include "telnet_protocol.h"
+#include "ssh_transport.h"
 
-/* Transport limits define concurrency and lifecycle deadlines. */
+/*
+ * The reference server caps all transports together. Thread-per-connection is
+ * intentionally simple here; the cap makes that simplicity a bounded choice.
+ */
 #define MAX_ACTIVE_CONNECTIONS 64U
 #define TLS_HANDSHAKE_TIMEOUT_MS 10000ULL
 #define LOGIN_TIMEOUT_MS 120000ULL
@@ -54,11 +58,17 @@
 #define TLS_SHUTDOWN_TIMEOUT_MS 3000ULL
 #define SOCKET_READ_TICK_MS 1000U
 #define SOCKET_WRITE_TIMEOUT_MS 10000U
+#define MAX_LISTENER_SOCKETS 6U
+#define LISTENER_UNAVAILABLE (-2)
 
 /* Shared objects live until the listener and all workers have stopped. */
 struct server_runtime {
     SSL_CTX *tls_context;
     player_store *store;
+    terminal_application_hooks application;
+    telnet_mssp_query_fn mssp_query;
+    void *mssp_context;
+    const char *ssh_host_key_path;
     security_policy *security;
     audit_log *audit;
 
@@ -70,7 +80,8 @@ struct server_runtime {
 
 enum connection_transport_kind {
     CONNECTION_TRANSPORT_TELNET = 0,
-    CONNECTION_TRANSPORT_TELNET_TLS
+    CONNECTION_TRANSPORT_TELNET_TLS,
+    CONNECTION_TRANSPORT_SSH
 };
 
 /* Immutable connection data transferred to one detached worker thread. */
@@ -82,9 +93,9 @@ struct worker_args {
 };
 
 /*
- * Telnet writes through one callback regardless of the socket transport. This
- * is intentionally small: SSH will later be its own terminal adapter rather
- * than another branch inside the Telnet protocol parser.
+ * Telnet writes through one callback regardless of whether the underlying
+ * socket is plain or TLS. SSH never enters this writer; its channel adapter has
+ * a separate output path and joins only at terminal_application.
  */
 struct connection_writer {
     enum connection_transport_kind transport;
@@ -232,11 +243,19 @@ static void runtime_wait_for_workers(
     pthread_mutex_unlock(&runtime->mutex);
 }
 
+
 static const char *transport_label(enum connection_transport_kind transport)
 {
-    return transport == CONNECTION_TRANSPORT_TELNET_TLS
-        ? "telnet-tls"
-        : "telnet";
+    switch (transport) {
+    case CONNECTION_TRANSPORT_TELNET:
+        return "telnet";
+    case CONNECTION_TRANSPORT_TELNET_TLS:
+        return "telnet-tls";
+    case CONNECTION_TRANSPORT_SSH:
+        return "ssh";
+    default:
+        return "unknown";
+    }
 }
 
 static void connection_write(
@@ -357,7 +376,7 @@ static SSL_CTX *create_tls_context(
 
     /*
      * TLS 1.3 has no renegotiation. OpenSSL's maintained TLS 1.3 cipher
-     * defaults are a better fit here than a cipher list we'd have to babysit.
+     * defaults are used here instead of maintaining a separate cipher list.
      */
     SSL_CTX_set_mode(context, SSL_MODE_AUTO_RETRY);
 
@@ -395,14 +414,35 @@ static SSL_CTX *create_tls_context(
     return context;
 }
 
-static int create_loopback_listener(uint16_t port)
+static int ipv6_unavailable_error(int error_number)
+{
+    return error_number == EAFNOSUPPORT ||
+           error_number == EPROTONOSUPPORT ||
+           error_number == EADDRNOTAVAIL;
+}
+
+/*
+ * The reference harness listens only on loopback, but it does so on both IP
+ * families when the host has IPv6 loopback available. IPv6 is kept V6ONLY so
+ * the IPv4 listener remains explicit instead of depending on platform-specific
+ * dual-stack defaults.
+ */
+static int create_loopback_listener(
+    int family,
+    uint16_t port,
+    int optional
+)
 {
     int listener;
     int enabled = 1;
-    struct sockaddr_in address;
+    struct sockaddr_storage storage;
+    socklen_t address_length;
 
-    listener = socket(AF_INET, SOCK_STREAM, 0);
+    listener = socket(family, SOCK_STREAM, 0);
     if (listener < 0) {
+        if (optional && ipv6_unavailable_error(errno)) {
+            return LISTENER_UNAVAILABLE;
+        }
         perror("socket");
         return -1;
     }
@@ -426,18 +466,56 @@ static int create_loopback_listener(uint16_t port)
         return -1;
     }
 
-    memset(&address, 0, sizeof(address));
-    address.sin_family = AF_INET;
-    address.sin_port = htons(port);
-    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    memset(&storage, 0, sizeof(storage));
+    if (family == AF_INET) {
+        struct sockaddr_in *address = (struct sockaddr_in *)&storage;
+        address->sin_family = AF_INET;
+        address->sin_port = htons(port);
+        address->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        address_length = sizeof(*address);
+    } else if (family == AF_INET6) {
+        struct sockaddr_in6 *address = (struct sockaddr_in6 *)&storage;
+        int ipv6_only = 1;
+
+        if (setsockopt(
+                listener,
+                IPPROTO_IPV6,
+                IPV6_V6ONLY,
+                &ipv6_only,
+                sizeof(ipv6_only)
+            ) != 0) {
+            int saved_errno = errno;
+            close(listener);
+            if (optional && ipv6_unavailable_error(saved_errno)) {
+                return LISTENER_UNAVAILABLE;
+            }
+            errno = saved_errno;
+            perror("setsockopt(IPV6_V6ONLY)");
+            return -1;
+        }
+
+        address->sin6_family = AF_INET6;
+        address->sin6_port = htons(port);
+        address->sin6_addr = in6addr_loopback;
+        address_length = sizeof(*address);
+    } else {
+        close(listener);
+        errno = EAFNOSUPPORT;
+        return -1;
+    }
 
     if (bind(
             listener,
-            (const struct sockaddr *)&address,
-            sizeof(address)
+            (const struct sockaddr *)&storage,
+            address_length
         ) != 0) {
-        perror("bind");
+        int saved_errno = errno;
         close(listener);
+        if (optional && ipv6_unavailable_error(saved_errno)) {
+            return LISTENER_UNAVAILABLE;
+        }
+        errno = saved_errno;
+        perror("bind");
         return -1;
     }
 
@@ -615,6 +693,42 @@ static void *connection_worker(void *opaque)
         SOCKET_READ_TICK_MS
     );
 
+    if (transport == CONNECTION_TRANSPORT_SSH) {
+        ssh_transport_connection_config ssh_config = {
+            .client_fd = client_fd,
+            .peer = peer,
+            .host_key_path = runtime->ssh_host_key_path,
+            .store = runtime->store,
+            .security = runtime->security,
+            .audit = runtime->audit,
+            .application = runtime->application.open != NULL
+                ? &runtime->application : NULL
+        };
+
+        /*
+         * libssh owns channel flow control, but the underlying socket still
+         * gets a finite write timeout so a dead peer cannot pin this worker
+         * forever below the SSH packet layer.
+         */
+        (void)set_socket_timeout(
+            client_fd,
+            SO_SNDTIMEO,
+            SOCKET_WRITE_TIMEOUT_MS
+        );
+
+        audit_log_event(
+            runtime->audit,
+            "ssh_connection",
+            peer,
+            "accepted SSH terminal transport"
+        );
+        (void)ssh_transport_run_connection(&ssh_config);
+
+        /* ssh_transport_run_connection owns client_fd once called. */
+        runtime_release_connection(runtime);
+        return NULL;
+    }
+
     if (transport == CONNECTION_TRANSPORT_TELNET_TLS) {
         ssl = SSL_new(runtime->tls_context);
         if (ssl == NULL) {
@@ -668,7 +782,11 @@ static void *connection_worker(void *opaque)
             .writer = connection_write,
             .writer_context = &writer,
             .transport_secure =
-                transport == CONNECTION_TRANSPORT_TELNET_TLS
+                transport == CONNECTION_TRANSPORT_TELNET_TLS,
+            .application = runtime->application.open != NULL
+                ? &runtime->application : NULL,
+            .mssp_query = runtime->mssp_query,
+            .mssp_context = runtime->mssp_context
         };
 
         session = telnet_session_create(&config);
@@ -882,28 +1000,37 @@ cleanup:
 }
 
 static int peer_string(
-    const struct sockaddr_in *address,
+    const struct sockaddr_storage *address,
     char *output,
     size_t output_size
 )
 {
-    char ip[INET_ADDRSTRLEN];
+    const void *source;
+    int family;
+    char ip[INET6_ADDRSTRLEN];
 
-    if (inet_ntop(
-            AF_INET,
-            &address->sin_addr,
-            ip,
-            sizeof(ip)
-        ) == NULL) {
+    if (address == NULL) {
         return -1;
     }
 
-    if (snprintf(
-            output,
-            output_size,
-            "%s",
-            ip
-        ) >= (int)output_size) {
+    family = address->ss_family;
+    if (family == AF_INET) {
+        const struct sockaddr_in *ipv4 =
+            (const struct sockaddr_in *)address;
+        source = &ipv4->sin_addr;
+    } else if (family == AF_INET6) {
+        const struct sockaddr_in6 *ipv6 =
+            (const struct sockaddr_in6 *)address;
+        source = &ipv6->sin6_addr;
+    } else {
+        return -1;
+    }
+
+    if (inet_ntop(family, source, ip, sizeof(ip)) == NULL) {
+        return -1;
+    }
+
+    if (snprintf(output, output_size, "%s", ip) >= (int)output_size) {
         return -1;
     }
 
@@ -916,7 +1043,7 @@ static int accept_connection(
     enum connection_transport_kind transport
 )
 {
-    struct sockaddr_in remote_address;
+    struct sockaddr_storage remote_address;
     socklen_t remote_length = sizeof(remote_address);
     struct worker_args *args;
     pthread_t thread;
@@ -1015,12 +1142,19 @@ int secure_server_run(const secure_server_config *config)
     player_store *store = NULL;
     security_policy *security = NULL;
     audit_log *audit = NULL;
-    int plain_listener = -1;
-    int tls_listener = -1;
+    int listener_fds[MAX_LISTENER_SOCKETS];
+    enum connection_transport_kind listener_transports[MAX_LISTENER_SOCKETS];
+    size_t listener_count = 0;
+    int ipv6_enabled = 0;
+    int ssh_initialized = 0;
     int exit_status = -1;
+    size_t listener_index;
 
     memset(&runtime, 0, sizeof(runtime));
     memset(&action, 0, sizeof(action));
+    for (listener_index = 0; listener_index < MAX_LISTENER_SOCKETS; ++listener_index) {
+        listener_fds[listener_index] = -1;
+    }
 
     stop_requested = 0;
 
@@ -1031,7 +1165,12 @@ int secure_server_run(const secure_server_config *config)
         config->audit_log_path == NULL ||
         config->telnet_port == 0 ||
         config->telnet_tls_port == 0 ||
-        config->telnet_port == config->telnet_tls_port) {
+        config->telnet_port == config->telnet_tls_port ||
+        (config->ssh_port != 0 &&
+         (config->ssh_host_key_path == NULL ||
+          config->application == NULL ||
+          config->ssh_port == config->telnet_port ||
+          config->ssh_port == config->telnet_tls_port))) {
         fprintf(stderr, "Invalid server configuration.\n");
         return -1;
     }
@@ -1039,6 +1178,15 @@ int secure_server_run(const secure_server_config *config)
     /* High unprivileged ports let the server keep root out of the trust model. */
     if (geteuid() == 0) {
         fprintf(stderr, "Refusing to run the server as root.\n");
+        return -1;
+    }
+
+    if (config->ssh_port != 0 &&
+        ssh_transport_validate_host_key(config->ssh_host_key_path) != 0) {
+        fprintf(
+            stderr,
+            "SSH host key must be a private regular file owned by this user.\n"
+        );
         return -1;
     }
 
@@ -1054,15 +1202,24 @@ int secure_server_run(const secure_server_config *config)
         return -1;
     }
 
+    /* Explicit init happens before any SSH worker thread is created. */
+    if (config->ssh_port != 0) {
+        if (ssh_transport_global_init() != 0) {
+            fprintf(stderr, "Unable to initialize libssh.\n");
+            return -1;
+        }
+        ssh_initialized = 1;
+    }
+
     if (pthread_mutex_init(&runtime.mutex, NULL) != 0) {
         fprintf(stderr, "Unable to initialize server synchronization.\n");
-        return -1;
+        goto cleanup_ssh;
     }
 
     if (pthread_cond_init(&runtime.condition, NULL) != 0) {
         fprintf(stderr, "Unable to initialize server synchronization.\n");
         pthread_mutex_destroy(&runtime.mutex);
-        return -1;
+        goto cleanup_ssh;
     }
 
     audit = audit_log_open(config->audit_log_path);
@@ -1088,18 +1245,73 @@ int secure_server_run(const secure_server_config *config)
         goto cleanup;
     }
 
-    plain_listener = create_loopback_listener(config->telnet_port);
-    if (plain_listener < 0) {
+    listener_fds[listener_count] = create_loopback_listener(
+        AF_INET, config->telnet_port, 0
+    );
+    if (listener_fds[listener_count] < 0) {
         goto cleanup;
     }
+    listener_transports[listener_count++] = CONNECTION_TRANSPORT_TELNET;
 
-    tls_listener = create_loopback_listener(config->telnet_tls_port);
-    if (tls_listener < 0) {
+    listener_fds[listener_count] = create_loopback_listener(
+        AF_INET6, config->telnet_port, 1
+    );
+    if (listener_fds[listener_count] == -1) {
         goto cleanup;
+    }
+    if (listener_fds[listener_count] >= 0) {
+        listener_transports[listener_count++] = CONNECTION_TRANSPORT_TELNET;
+        ipv6_enabled = 1;
+    }
+
+    listener_fds[listener_count] = create_loopback_listener(
+        AF_INET, config->telnet_tls_port, 0
+    );
+    if (listener_fds[listener_count] < 0) {
+        goto cleanup;
+    }
+    listener_transports[listener_count++] = CONNECTION_TRANSPORT_TELNET_TLS;
+
+    listener_fds[listener_count] = create_loopback_listener(
+        AF_INET6, config->telnet_tls_port, 1
+    );
+    if (listener_fds[listener_count] == -1) {
+        goto cleanup;
+    }
+    if (listener_fds[listener_count] >= 0) {
+        listener_transports[listener_count++] = CONNECTION_TRANSPORT_TELNET_TLS;
+        ipv6_enabled = 1;
+    }
+
+    if (config->ssh_port != 0) {
+        listener_fds[listener_count] = create_loopback_listener(
+            AF_INET, config->ssh_port, 0
+        );
+        if (listener_fds[listener_count] < 0) {
+            goto cleanup;
+        }
+        listener_transports[listener_count++] = CONNECTION_TRANSPORT_SSH;
+
+        listener_fds[listener_count] = create_loopback_listener(
+            AF_INET6, config->ssh_port, 1
+        );
+        if (listener_fds[listener_count] == -1) {
+            goto cleanup;
+        }
+        if (listener_fds[listener_count] >= 0) {
+            listener_transports[listener_count++] = CONNECTION_TRANSPORT_SSH;
+            ipv6_enabled = 1;
+        }
     }
 
     runtime.tls_context = context;
     runtime.store = store;
+    if (config->application != NULL) {
+        runtime.application = *config->application;
+    }
+    runtime.mssp_query = config->mssp_query;
+    runtime.mssp_context = config->mssp_context;
+    runtime.ssh_host_key_path = config->ssh_host_key_path;
     runtime.security = security;
     runtime.audit = audit;
 
@@ -1107,38 +1319,50 @@ int secure_server_run(const secure_server_config *config)
         audit,
         "server_start",
         "local",
-        "plain Telnet and TLS 1.3 Telnet listeners started"
+        config->ssh_port != 0
+            ? "Telnet, TLS Telnet, and SSH listeners started"
+            : "plain Telnet and TLS 1.3 Telnet listeners started"
     );
 
     fprintf(
         stdout,
-        "Plain Telnet compatibility listener ready on 127.0.0.1:%u.\n",
-        (unsigned int)config->telnet_port
+        "Plain Telnet compatibility listener ready on 127.0.0.1:%u%s.\n",
+        (unsigned int)config->telnet_port,
+        ipv6_enabled ? " and IPv6 loopback" : ""
     );
     fprintf(
         stdout,
-        "Encrypted Telnet listener ready on 127.0.0.1:%u using TLS 1.3.\n",
-        (unsigned int)config->telnet_tls_port
+        "Encrypted Telnet listener ready on 127.0.0.1:%u%s using TLS 1.3.\n",
+        (unsigned int)config->telnet_tls_port,
+        ipv6_enabled ? " and IPv6 loopback" : ""
     );
+    if (config->ssh_port != 0) {
+        fprintf(
+            stdout,
+            "SSH terminal listener ready on 127.0.0.1:%u%s.\n",
+            (unsigned int)config->ssh_port,
+            ipv6_enabled ? " and IPv6 loopback" : ""
+        );
+    }
     fprintf(
         stdout,
-        "Both transports share one Telnet, login, policy, and player store.\n"
+        "Connection policy is shared across all enabled transports.\n"
     );
     fflush(stdout);
 
     while (!stop_requested) {
-        struct pollfd listeners[2];
+        struct pollfd poll_fds[MAX_LISTENER_SOCKETS];
         int result;
-        int i;
+        nfds_t i;
         int fatal_listener_error = 0;
 
-        memset(listeners, 0, sizeof(listeners));
-        listeners[0].fd = plain_listener;
-        listeners[0].events = POLLIN;
-        listeners[1].fd = tls_listener;
-        listeners[1].events = POLLIN;
+        memset(poll_fds, 0, sizeof(poll_fds));
+        for (i = 0; i < (nfds_t)listener_count; ++i) {
+            poll_fds[i].fd = listener_fds[i];
+            poll_fds[i].events = POLLIN;
+        }
 
-        result = poll(listeners, 2, 1000);
+        result = poll(poll_fds, (nfds_t)listener_count, 1000);
         if (result < 0) {
             if (errno == EINTR) {
                 continue;
@@ -1157,13 +1381,10 @@ int secure_server_run(const secure_server_config *config)
             continue;
         }
 
-        for (i = 0; i < 2; ++i) {
-            enum connection_transport_kind transport =
-                i == 0
-                    ? CONNECTION_TRANSPORT_TELNET
-                    : CONNECTION_TRANSPORT_TELNET_TLS;
+        for (i = 0; i < (nfds_t)listener_count; ++i) {
+            enum connection_transport_kind transport = listener_transports[i];
 
-            if (listeners[i].revents & (POLLERR | POLLHUP | POLLNVAL)) {
+            if (poll_fds[i].revents & (POLLERR | POLLHUP | POLLNVAL)) {
                 audit_log_event(
                     audit,
                     "listener_failure",
@@ -1174,10 +1395,10 @@ int secure_server_run(const secure_server_config *config)
                 break;
             }
 
-            if ((listeners[i].revents & POLLIN) != 0 &&
+            if ((poll_fds[i].revents & POLLIN) != 0 &&
                 accept_connection(
                     &runtime,
-                    listeners[i].fd,
+                    poll_fds[i].fd,
                     transport
                 ) != 0) {
                 perror("accept");
@@ -1200,13 +1421,11 @@ int secure_server_run(const secure_server_config *config)
     exit_status = stop_requested ? 0 : -1;
     runtime_begin_shutdown(&runtime);
 
-    if (plain_listener >= 0) {
-        close(plain_listener);
-        plain_listener = -1;
-    }
-    if (tls_listener >= 0) {
-        close(tls_listener);
-        tls_listener = -1;
+    for (listener_index = 0; listener_index < listener_count; ++listener_index) {
+        if (listener_fds[listener_index] >= 0) {
+            close(listener_fds[listener_index]);
+            listener_fds[listener_index] = -1;
+        }
     }
 
     runtime_wait_for_workers(&runtime);
@@ -1219,11 +1438,11 @@ int secure_server_run(const secure_server_config *config)
     );
 
 cleanup:
-    if (plain_listener >= 0) {
-        close(plain_listener);
-    }
-    if (tls_listener >= 0) {
-        close(tls_listener);
+    for (listener_index = 0; listener_index < listener_count; ++listener_index) {
+        if (listener_fds[listener_index] >= 0) {
+            close(listener_fds[listener_index]);
+            listener_fds[listener_index] = -1;
+        }
     }
 
     SSL_CTX_free(context);
@@ -1234,6 +1453,11 @@ cleanup:
 cleanup_runtime:
     pthread_cond_destroy(&runtime.condition);
     pthread_mutex_destroy(&runtime.mutex);
+
+cleanup_ssh:
+    if (ssh_initialized) {
+        ssh_transport_global_cleanup();
+    }
 
     return exit_status;
 }

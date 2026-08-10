@@ -38,7 +38,7 @@
 #define AUDIT_MAX_BYTES (5ULL * 1024ULL * 1024ULL)
 #define AUDIT_ARCHIVES 4
 
-/* Rotation and writes share one lock; mixing those two would get ugly fast. */
+/* Rotation and writes share one lock so file state cannot change mid-write. */
 struct audit_log {
     pthread_mutex_t mutex;
     int fd;

@@ -9,8 +9,8 @@
  *
  * Anything untrusted that may reach a user's terminal should pass through this
  * boundary before presentation. It is deliberately separate from the Telnet
- * parser because the same player-authored text will eventually be rendered to
- * Telnet, TLS Telnet, SSH, and possibly other terminal transports. ANSI escapes,
+ * parser because the same player-authored text may be rendered over plain
+ * Telnet, TLS Telnet, SSH, or another terminal transport. ANSI escapes,
  * Telnet command bytes, unsafe controls, malformed UTF-8, and selected Unicode
  * display controls are filtered here rather than trusted to every caller.
  */

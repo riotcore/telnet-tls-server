@@ -6,8 +6,8 @@
  *
  * Coverage-guided parser harness for Clang libFuzzer. Every generated input gets
  * a fresh Telnet session and fresh abuse-control state. A private temporary
- * player store lasts for the fuzz process. Protocol output goes nowhere; the
- * parser is the thing under the microscope here.
+ * player store lasts for the fuzz process. Protocol output is discarded so
+ * fuzzing can focus on parser and session-state behavior.
  */
 
 #define _POSIX_C_SOURCE 200809L

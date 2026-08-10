@@ -61,9 +61,8 @@ struct loaded_record {
 };
 
 /*
- * This is a starter denylist, not a comprehensive password database.
- * It catches a few painfully obvious choices and gives the policy a clear
- * extension point if a breached-password source is added later.
+ * This is a small starter denylist, not a comprehensive password database.
+ * A deployment can replace or extend it with a breached-password source.
  */
 static const char *const blocked_passwords[] = {
     "password",

@@ -24,7 +24,7 @@
 #define PEER_KEY_BYTES 96
 #define ACCOUNT_KEY_BYTES 32
 
-/* Connection-start windows protect TLS setup and worker allocation. */
+/* Connection-start windows protect worker allocation and expensive handshakes. */
 #define PEER_CONNECTION_LIMIT 5
 #define PEER_CONNECTION_WINDOW_MS 10000ULL
 #define GLOBAL_CONNECTION_LIMIT 30

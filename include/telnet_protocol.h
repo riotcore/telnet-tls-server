@@ -14,12 +14,10 @@
  * security_policy. Keeping those concerns separate makes the Telnet adapter
  * reusable when the surrounding game architecture changes.
  *
- * This standalone repository currently keeps a minimal account/login and
- * command loop in the Telnet session so the public slice can run and be tested
- * by itself. A complete MUD should eventually place account/game-session
- * ownership above this adapter, which is the same seam a future SSH transport
- * will use. Higher layers should consume negotiated capabilities rather than
- * branch on a particular MUD client name.
+ * The standalone harness still keeps its small Telnet account dialogue here.
+ * After authentication, the session can be handed to terminal_application,
+ * which is also used by SSH. Application code can use the reported terminal
+ * capabilities without depending on a particular MUD client name.
  */
 
 #include <stddef.h>
@@ -28,6 +26,7 @@
 #include "audit_log.h"
 #include "player_store.h"
 #include "security_policy.h"
+#include "terminal_application.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -36,6 +35,22 @@ extern "C" {
 #define TELNET_TERMINAL_TYPE_MAX 40
 #define TELNET_CLIENT_NAME_MAX 40
 #define TELNET_CLIENT_VERSION_MAX 40
+#define TELNET_MSSP_NAME_MAX 80
+#define TELNET_MSSP_CODEBASE_MAX 80
+
+typedef struct telnet_mssp_status {
+    char name[TELNET_MSSP_NAME_MAX + 1];
+    unsigned int players;
+    uint64_t uptime;
+    uint16_t telnet_port;
+    uint16_t telnet_tls_port;
+    char codebase[TELNET_MSSP_CODEBASE_MAX + 1];
+} telnet_mssp_status;
+
+typedef void (*telnet_mssp_query_fn)(
+    void *context,
+    telnet_mssp_status *status
+);
 
 /* MTTS bit values are exposed so presentation code can make capability choices. */
 enum telnet_mtts_capability {
@@ -71,10 +86,17 @@ typedef struct telnet_session_config {
 
     /* Used only for security-aware presentation; Telnet itself is unchanged. */
     int transport_secure;
+
+    /* Optional application owner shared by Telnet and sibling transports. */
+    const terminal_application_hooks *application;
+
+    /* Optional MSSP snapshot callback. The harness can leave it NULL. */
+    telnet_mssp_query_fn mssp_query;
+    void *mssp_context;
 } telnet_session_config;
 
 /*
- * Negotiated/reported terminal capabilities exposed to future application
+ * Negotiated/reported terminal capabilities exposed to application
  * systems. Defaults remain conservative so a client that negotiates nothing is
  * still fully usable as a basic line-oriented terminal.
  */
@@ -98,6 +120,12 @@ typedef struct telnet_terminal_info {
     int truecolor;
     int screen_reader;
     int mnes;
+    int mssp;
+    int gmcp;
+    int osc8;
+    int osc8_send;
+    int osc8_prompt;
+    int osc8_tooltip;
 
     char terminal_type[TELNET_TERMINAL_TYPE_MAX + 1];
     char client_name[TELNET_CLIENT_NAME_MAX + 1];
@@ -145,7 +173,7 @@ int telnet_session_feed(
     size_t length
 );
 
-/* Session state queries used by the transport and future application layer. */
+/* Session state queries used by transport code and the application seam. */
 int telnet_session_is_in_game(const telnet_session *session);
 int telnet_session_should_close(const telnet_session *session);
 const char *telnet_session_player_name(const telnet_session *session);

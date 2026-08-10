@@ -9,9 +9,9 @@
  *
  * Name rules, password policy, Argon2id verifiers, private account files,
  * atomic writes, and hash upgrades live here. There is intentionally no TCP,
- * TLS, Telnet, terminal, or game-world logic in this owner: Telnet today and a
- * future SSH authenticator should be able to verify the same account without
- * duplicating the credential format.
+ * TLS, Telnet, SSH, terminal, or game-world logic in this owner. Telnet and
+ * SSH both verify the same account records instead of inventing transport-
+ * specific credential formats.
  */
 
 #include <stddef.h>

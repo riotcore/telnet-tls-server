@@ -10,11 +10,10 @@
  * and encodes application output back onto the Telnet stream. It does not own
  * sockets or TLS; those arrive through the writer/feed boundary.
  *
- * The small login and command loop also lives here today so this repository is
- * independently runnable and testable. That is a packaging decision, not a
- * requirement that MUD authentication forever belong to Telnet. When the game
- * grows multiple transports, account and game-session ownership should move
- * above this adapter while this parser/capability layer remains unchanged.
+ * Telnet still owns the small account dialogue used by the runnable reference.
+ * After authentication it can attach terminal_application, which is also where
+ * SSH arrives. That keeps the example useful by itself without making Telnet
+ * framing the application's permanent account/session architecture.
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -75,6 +74,21 @@ struct rate_window {
     size_t used;
 };
 
+#define GMCP_PACKAGE_MAX_BYTES 96U
+#define GMCP_JSON_MAX_BYTES 3968U
+
+/*
+ * GMCP Core.Hello/Supports are normally sent before a player has authenticated.
+ * The application seam opens after authentication, so keep a tiny bounded queue
+ * rather than silently throwing that early client handshake away.
+ */
+#define PENDING_GMCP_CORE_MAX 4U
+struct pending_gmcp_core_message {
+    char package_name[GMCP_PACKAGE_MAX_BYTES + 1];
+    char json_payload[GMCP_JSON_MAX_BYTES + 1];
+    size_t json_length;
+};
+
 /* Complete mutable state owned by one Telnet connection. */
 struct telnet_session {
     player_store *store;
@@ -84,6 +98,17 @@ struct telnet_session {
 
     telnet_write_fn writer;
     void *writer_context;
+
+    terminal_application_hooks application;
+    terminal_output application_output;
+    void *application_session;
+
+    telnet_mssp_query_fn mssp_query;
+    void *mssp_context;
+    int mssp_sent;
+
+    struct pending_gmcp_core_message pending_gmcp_core[PENDING_GMCP_CORE_MAX];
+    size_t pending_gmcp_core_count;
 
     enum login_state login;
     enum parser_state parser;
@@ -103,7 +128,7 @@ struct telnet_session {
     int insecure_warning_shown;
 
     unsigned char subnegotiation_option;
-    unsigned char subnegotiation[256];
+    unsigned char subnegotiation[4096];
     size_t subnegotiation_length;
 
     int started;
@@ -111,7 +136,7 @@ struct telnet_session {
     unsigned int protocol_violations;
     int pending_cr;
 
-    char line[PLAYER_PASSWORD_MAX + 1];
+    char line[513];
     size_t line_length;
     int line_overflow;
 
@@ -132,7 +157,9 @@ struct telnet_session {
 #define INPUT_LINES_WINDOW_MS 10000ULL
 #define COMMANDS_PER_WINDOW 25U
 #define COMMANDS_WINDOW_MS 5000ULL
-#define SUBNEGOTIATION_MAX_BYTES 256U
+#define SUBNEGOTIATION_MAX_BYTES 4096U
+#define APPLICATION_LINE_MAX 512U
+#define MSSP_PAYLOAD_MAX_BYTES 2048U
 #define PROTOCOL_VIOLATION_LIMIT 8U
 #define TERMINAL_TYPE_REQUEST_LIMIT 4U
 
@@ -142,6 +169,12 @@ struct telnet_session {
 #define MAX_TERMINAL_WIDTH 500U
 #define MIN_TERMINAL_HEIGHT 5U
 #define MAX_TERMINAL_HEIGHT 200U
+
+static void request_close(
+    telnet_session *session,
+    const char *event,
+    const char *message
+);
 
 static uint64_t monotonic_milliseconds(void)
 {
@@ -353,7 +386,11 @@ static int q_accept_callback(
             case TELNET_OPT_SUPPRESS_GO_AHEAD:
             case TELNET_OPT_END_OF_RECORD:
             case TELNET_OPT_CHARSET:
+            case TELNET_OPT_GMCP:
                 return 1;
+
+            case TELNET_OPT_MSSP:
+                return session->mssp_query != NULL;
 
             case TELNET_OPT_ECHO:
                 return session->echo_desired;
@@ -411,6 +448,517 @@ static void send_subnegotiation(
     }
 
     write_raw(session, end, sizeof(end));
+}
+
+static int mssp_append_pair(
+    unsigned char *payload,
+    size_t payload_size,
+    size_t *used,
+    const char *name,
+    const char *value
+)
+{
+    size_t name_length;
+    size_t value_length;
+    size_t i;
+
+    if (payload == NULL || used == NULL || name == NULL || value == NULL) {
+        return -1;
+    }
+    name_length = strlen(name);
+    value_length = strlen(value);
+    if (name_length == 0 ||
+        *used + 2U + name_length + value_length > payload_size) {
+        return -1;
+    }
+
+    for (i = 0; i < name_length; ++i) {
+        unsigned char ch = (unsigned char)name[i];
+        if (!((ch >= 'A' && ch <= 'Z') || ch == ' ')) {
+            return -1;
+        }
+    }
+    for (i = 0; i < value_length; ++i) {
+        unsigned char ch = (unsigned char)value[i];
+        if (ch == 0 || ch == 1 || ch == 2 || ch == TELNET_IAC) {
+            return -1;
+        }
+    }
+
+    payload[(*used)++] = 1; /* MSSP_VAR */
+    memcpy(payload + *used, name, name_length);
+    *used += name_length;
+    payload[(*used)++] = 2; /* MSSP_VAL */
+    memcpy(payload + *used, value, value_length);
+    *used += value_length;
+    return 0;
+}
+
+static void send_mssp_status(telnet_session *session)
+{
+    unsigned char payload[MSSP_PAYLOAD_MAX_BYTES];
+    telnet_mssp_status status;
+    char players[32];
+    char uptime[32];
+    char plain_port[16];
+    char tls_port[16];
+    size_t used = 0;
+
+    if (session == NULL || session->mssp_sent || session->mssp_query == NULL ||
+        !telnet_q_enabled(
+            &session->options,
+            TELNET_Q_LOCAL,
+            TELNET_OPT_MSSP
+        )) {
+        return;
+    }
+
+    memset(&status, 0, sizeof(status));
+    session->mssp_query(session->mssp_context, &status);
+    if (status.name[0] == '\0') {
+        memcpy(status.name, "mud-terminal-core", sizeof("mud-terminal-core"));
+    }
+    if (status.codebase[0] == '\0') {
+        memcpy(status.codebase, "mud-terminal-core", sizeof("mud-terminal-core"));
+    }
+
+    (void)snprintf(players, sizeof(players), "%u", status.players);
+    (void)snprintf(uptime, sizeof(uptime), "%llu",
+                   (unsigned long long)status.uptime);
+    (void)snprintf(plain_port, sizeof(plain_port), "%u",
+                   (unsigned int)status.telnet_port);
+    (void)snprintf(tls_port, sizeof(tls_port), "%u",
+                   (unsigned int)status.telnet_tls_port);
+
+    if (mssp_append_pair(payload, sizeof(payload), &used, "NAME", status.name) != 0 ||
+        mssp_append_pair(payload, sizeof(payload), &used, "PLAYERS", players) != 0 ||
+        mssp_append_pair(payload, sizeof(payload), &used, "UPTIME", uptime) != 0 ||
+        mssp_append_pair(payload, sizeof(payload), &used, "CHARSET", "UTF-8") != 0 ||
+        mssp_append_pair(payload, sizeof(payload), &used, "CODEBASE", status.codebase) != 0) {
+        audit(session, "mssp_status_error", "unable to encode MSSP snapshot");
+        return;
+    }
+
+    if (status.telnet_port != 0 &&
+        mssp_append_pair(payload, sizeof(payload), &used, "PORT", plain_port) != 0) {
+        return;
+    }
+    if (status.telnet_tls_port != 0 &&
+        mssp_append_pair(payload, sizeof(payload), &used, "SSL", tls_port) != 0) {
+        return;
+    }
+
+    session->mssp_sent = 1;
+    send_subnegotiation(session, TELNET_OPT_MSSP, payload, used);
+}
+
+static int gmcp_package_valid(const char *package_name)
+{
+    size_t length;
+    size_t i;
+
+    if (package_name == NULL) {
+        return 0;
+    }
+    length = strlen(package_name);
+    if (length == 0 || length > GMCP_PACKAGE_MAX_BYTES) {
+        return 0;
+    }
+
+    for (i = 0; i < length; ++i) {
+        unsigned char ch = (unsigned char)package_name[i];
+        int letter =
+            (ch >= 'A' && ch <= 'Z') ||
+            (ch >= 'a' && ch <= 'z');
+        int digit = ch >= '0' && ch <= '9';
+        if (!letter && !digit && ch != '.' && ch != '_' && ch != '-') {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int send_gmcp_message(
+    telnet_session *session,
+    const char *package_name,
+    const char *json_payload
+)
+{
+    unsigned char payload[SUBNEGOTIATION_MAX_BYTES];
+    size_t package_length;
+    size_t json_length = 0;
+    size_t used = 0;
+
+    if (session == NULL ||
+        !session->terminal.gmcp ||
+        !gmcp_package_valid(package_name)) {
+        return -1;
+    }
+
+    package_length = strlen(package_name);
+    if (json_payload != NULL && json_payload[0] != '\0') {
+        json_length = strlen(json_payload);
+        if (json_length > GMCP_JSON_MAX_BYTES ||
+            !terminal_text_utf8_valid(
+                (const unsigned char *)json_payload,
+                json_length
+            )) {
+            return -1;
+        }
+    }
+
+    if (package_length + (json_length != 0 ? 1U + json_length : 0U) >
+        sizeof(payload)) {
+        return -1;
+    }
+
+    memcpy(payload + used, package_name, package_length);
+    used += package_length;
+    if (json_length != 0) {
+        payload[used++] = ' ';
+        memcpy(payload + used, json_payload, json_length);
+        used += json_length;
+    }
+
+    send_subnegotiation(session, TELNET_OPT_GMCP, payload, used);
+    return 0;
+}
+
+static int gmcp_package_equal(const char *left, const char *right)
+{
+    while (*left != '\0' && *right != '\0') {
+        unsigned char a = (unsigned char)*left;
+        unsigned char b = (unsigned char)*right;
+        if (a >= 'A' && a <= 'Z') a = (unsigned char)(a + ('a' - 'A'));
+        if (b >= 'A' && b <= 'Z') b = (unsigned char)(b + ('a' - 'A'));
+        if (a != b) return 0;
+        ++left;
+        ++right;
+    }
+    return *left == '\0' && *right == '\0';
+}
+
+static int gmcp_core_handshake_package(const char *package_name)
+{
+    return gmcp_package_equal(package_name, "Core.Hello") ||
+           gmcp_package_equal(package_name, "Core.Supports.Set") ||
+           gmcp_package_equal(package_name, "Core.Supports.Add") ||
+           gmcp_package_equal(package_name, "Core.Supports.Remove");
+}
+
+static void queue_pre_auth_gmcp_core(
+    telnet_session *session,
+    const char *package_name,
+    const char *json_payload,
+    size_t json_length
+)
+{
+    struct pending_gmcp_core_message *message;
+
+    if (session->application.gmcp == NULL ||
+        !gmcp_core_handshake_package(package_name)) {
+        return;
+    }
+
+    if (session->pending_gmcp_core_count >= PENDING_GMCP_CORE_MAX) {
+        audit(session, "gmcp_core_queue_full", "early Core handshake message dropped");
+        return;
+    }
+
+    message = &session->pending_gmcp_core[session->pending_gmcp_core_count++];
+    memcpy(message->package_name, package_name, strlen(package_name) + 1);
+    memcpy(message->json_payload, json_payload, json_length);
+    message->json_payload[json_length] = '\0';
+    message->json_length = json_length;
+}
+
+static void replay_pre_auth_gmcp_core(telnet_session *session)
+{
+    size_t index;
+
+    if (session->application_session == NULL || session->application.gmcp == NULL) {
+        session->pending_gmcp_core_count = 0;
+        return;
+    }
+
+    for (index = 0; index < session->pending_gmcp_core_count; ++index) {
+        const struct pending_gmcp_core_message *message =
+            &session->pending_gmcp_core[index];
+        session->application.gmcp(
+            session->application_session,
+            message->package_name,
+            message->json_payload,
+            message->json_length
+        );
+    }
+
+    session->pending_gmcp_core_count = 0;
+}
+
+static void handle_gmcp(telnet_session *session)
+{
+    char package_name[GMCP_PACKAGE_MAX_BYTES + 1];
+    char json_payload[GMCP_JSON_MAX_BYTES + 1];
+    size_t package_length = 0;
+    size_t json_length = 0;
+    size_t i = 0;
+
+    if (!telnet_q_enabled(
+            &session->options,
+            TELNET_Q_LOCAL,
+            TELNET_OPT_GMCP
+        ) || session->subnegotiation_length == 0) {
+        return;
+    }
+
+    while (i < session->subnegotiation_length &&
+           session->subnegotiation[i] != ' ') {
+        if (package_length >= GMCP_PACKAGE_MAX_BYTES) {
+            audit(session, "gmcp_invalid_message", "package name too long");
+            return;
+        }
+        package_name[package_length++] = (char)session->subnegotiation[i++];
+    }
+    package_name[package_length] = '\0';
+    if (!gmcp_package_valid(package_name)) {
+        audit(session, "gmcp_invalid_message", "invalid package name");
+        return;
+    }
+
+    if (i < session->subnegotiation_length && session->subnegotiation[i] == ' ') {
+        ++i;
+        json_length = session->subnegotiation_length - i;
+        if (json_length > GMCP_JSON_MAX_BYTES ||
+            !terminal_text_utf8_valid(session->subnegotiation + i, json_length)) {
+            audit(session, "gmcp_invalid_message", "invalid or oversized UTF-8 body");
+            return;
+        }
+        memcpy(json_payload, session->subnegotiation + i, json_length);
+    }
+    json_payload[json_length] = '\0';
+
+    /* Core.Ping has a protocol-defined no-body echo response. */
+    if (gmcp_package_equal(package_name, "Core.Ping")) {
+        (void)send_gmcp_message(session, "Core.Ping", NULL);
+    }
+
+    if (session->application_session != NULL && session->application.gmcp != NULL) {
+        session->application.gmcp(
+            session->application_session,
+            package_name,
+            json_payload,
+            json_length
+        );
+    } else {
+        queue_pre_auth_gmcp_core(
+            session,
+            package_name,
+            json_payload,
+            json_length
+        );
+    }
+}
+
+static int osc_uri_safe(const char *uri)
+{
+    size_t i;
+    size_t length;
+
+    if (uri == NULL || uri[0] == '\0') {
+        return 0;
+    }
+    length = strlen(uri);
+    if (length > 1024 ||
+        !terminal_text_utf8_valid((const unsigned char *)uri, length)) {
+        return 0;
+    }
+    for (i = 0; i < length; ++i) {
+        unsigned char ch = (unsigned char)uri[i];
+        if (ch < 0x20 || ch == 0x7f || ch == 0x1b) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static void write_application_text(telnet_session *session, const char *text)
+{
+    const char *start = text;
+    const char *cursor = text;
+
+    if (session == NULL || text == NULL) {
+        return;
+    }
+
+    while (*cursor != '\0') {
+        if (*cursor == '\n' && (cursor == text || cursor[-1] != '\r')) {
+            if (cursor > start) {
+                write_telnet_data(
+                    session,
+                    (const unsigned char *)start,
+                    (size_t)(cursor - start)
+                );
+            }
+            write_telnet_data(session, (const unsigned char *)"\r\n", 2);
+            start = cursor + 1;
+        }
+        ++cursor;
+    }
+    if (cursor > start) {
+        write_telnet_data(
+            session,
+            (const unsigned char *)start,
+            (size_t)(cursor - start)
+        );
+    }
+}
+
+static void application_write_text(void *context, const char *text)
+{
+    telnet_session *session = context;
+    if (session != NULL && text != NULL) {
+        write_application_text(session, text);
+    }
+}
+
+static void application_write_prompt(void *context, const char *text)
+{
+    telnet_session *session = context;
+    if (session != NULL && text != NULL) {
+        write_application_text(session, text);
+        if (session->terminal.local_eor) {
+            const unsigned char marker[2] = {TELNET_IAC, TELNET_EOR};
+            write_raw(session, marker, sizeof(marker));
+        } else if (!session->terminal.local_suppress_go_ahead) {
+            const unsigned char marker[2] = {TELNET_IAC, TELNET_GA};
+            write_raw(session, marker, sizeof(marker));
+        }
+    }
+}
+
+static void application_request_close(void *context, const char *message)
+{
+    telnet_session *session = context;
+    if (session != NULL) {
+        request_close(session, "application_close", message);
+    }
+}
+
+static int application_send_gmcp(
+    void *context,
+    const char *package_name,
+    const char *json_payload
+)
+{
+    return send_gmcp_message(
+        (telnet_session *)context,
+        package_name,
+        json_payload
+    );
+}
+
+static int application_write_link(
+    void *context,
+    const char *uri,
+    const char *label
+)
+{
+    telnet_session *session = context;
+    char safe_label[512];
+    const unsigned char begin[] = {'\033', ']', '8', ';', ';'};
+    const unsigned char end_link[] = {'\033', ']', '8', ';', ';', '\033', '\\'};
+    const unsigned char string_terminator[] = {'\033', '\\'};
+
+    if (session == NULL || label == NULL) {
+        return -1;
+    }
+
+    terminal_text_sanitize(
+        (const unsigned char *)label,
+        strlen(label),
+        safe_label,
+        sizeof(safe_label)
+    );
+
+    if (!session->terminal.osc8 || !osc_uri_safe(uri) ||
+        (strncmp(uri, "send:", 5) == 0 && !session->terminal.osc8_send) ||
+        (strncmp(uri, "prompt:", 7) == 0 && !session->terminal.osc8_prompt)) {
+        write_text(session, safe_label);
+        return 0;
+    }
+
+    write_telnet_data(session, begin, sizeof(begin));
+    write_telnet_data(
+        session,
+        (const unsigned char *)uri,
+        strlen(uri)
+    );
+    write_telnet_data(session, string_terminator, sizeof(string_terminator));
+    write_text(session, safe_label);
+    write_telnet_data(session, end_link, sizeof(end_link));
+    return 0;
+}
+
+static void copy_terminal_capabilities(
+    const telnet_session *session,
+    terminal_capabilities *capabilities
+)
+{
+    if (capabilities == NULL) {
+        return;
+    }
+    memset(capabilities, 0, sizeof(*capabilities));
+    if (session == NULL) {
+        capabilities->width = DEFAULT_TERMINAL_WIDTH;
+        capabilities->height = DEFAULT_TERMINAL_HEIGHT;
+        memcpy(capabilities->terminal_type, "UNKNOWN", sizeof("UNKNOWN"));
+        memcpy(capabilities->client_name, "UNKNOWN", sizeof("UNKNOWN"));
+        return;
+    }
+
+    capabilities->width = session->terminal.width;
+    capabilities->height = session->terminal.height;
+    capabilities->utf8 = session->terminal.utf8_enabled;
+    capabilities->ansi = session->terminal.ansi;
+    capabilities->color_256 = session->terminal.color_256;
+    capabilities->truecolor = session->terminal.truecolor;
+    capabilities->screen_reader = session->terminal.screen_reader;
+    capabilities->secure_transport = session->terminal.secure_transport;
+    capabilities->gmcp = session->terminal.gmcp;
+    capabilities->osc8 = session->terminal.osc8;
+    capabilities->osc8_send = session->terminal.osc8_send;
+    capabilities->osc8_prompt = session->terminal.osc8_prompt;
+    capabilities->osc8_tooltip = session->terminal.osc8_tooltip;
+    memcpy(
+        capabilities->terminal_type,
+        session->terminal.terminal_type,
+        sizeof(capabilities->terminal_type)
+    );
+    memcpy(
+        capabilities->client_name,
+        session->terminal.client_name,
+        sizeof(capabilities->client_name)
+    );
+    memcpy(
+        capabilities->client_version,
+        session->terminal.client_version,
+        sizeof(capabilities->client_version)
+    );
+}
+
+static void notify_application_capabilities(telnet_session *session)
+{
+    terminal_capabilities capabilities;
+
+    if (session == NULL || session->application_session == NULL ||
+        session->application.capabilities_changed == NULL) {
+        return;
+    }
+    copy_terminal_capabilities(session, &capabilities);
+    session->application.capabilities_changed(
+        session->application_session,
+        &capabilities
+    );
 }
 
 static void apply_mtts_flags(telnet_session *session, uint32_t flags)
@@ -495,8 +1043,14 @@ static void request_charset(telnet_session *session)
 
 static void request_new_environ(telnet_session *session)
 {
+    /*
+     * Ask for both the compact MNES VAR vocabulary and the RFC-style USERVAR
+     * names used by modern clients. Repeated facts are harmless: whichever
+     * report arrives last refreshes the same capability state.
+     */
     static const unsigned char payload[] = {
         NEW_ENVIRON_SEND,
+
         NEW_ENVIRON_VAR,
         'C','L','I','E','N','T','_','N','A','M','E',
         NEW_ENVIRON_VAR,
@@ -506,7 +1060,28 @@ static void request_new_environ(telnet_session *session)
         NEW_ENVIRON_VAR,
         'M','T','T','S',
         NEW_ENVIRON_VAR,
-        'T','E','R','M','I','N','A','L','_','T','Y','P','E'
+        'T','E','R','M','I','N','A','L','_','T','Y','P','E',
+
+        NEW_ENVIRON_USERVAR,
+        'C','L','I','E','N','T','_','N','A','M','E',
+        NEW_ENVIRON_USERVAR,
+        'C','L','I','E','N','T','_','V','E','R','S','I','O','N',
+        NEW_ENVIRON_USERVAR,
+        'C','H','A','R','S','E','T',
+        NEW_ENVIRON_USERVAR,
+        'M','T','T','S',
+        NEW_ENVIRON_USERVAR,
+        'T','E','R','M','I','N','A','L','_','T','Y','P','E',
+        NEW_ENVIRON_USERVAR,
+        'S','C','R','E','E','N','_','R','E','A','D','E','R',
+        NEW_ENVIRON_USERVAR,
+        'O','S','C','_','H','Y','P','E','R','L','I','N','K','S',
+        NEW_ENVIRON_USERVAR,
+        'O','S','C','_','H','Y','P','E','R','L','I','N','K','S','_','S','E','N','D',
+        NEW_ENVIRON_USERVAR,
+        'O','S','C','_','H','Y','P','E','R','L','I','N','K','S','_','P','R','O','M','P','T',
+        NEW_ENVIRON_USERVAR,
+        'O','S','C','_','H','Y','P','E','R','L','I','N','K','S','_','T','O','O','L','T','I','P'
     };
 
     if (session->new_environ_requested ||
@@ -565,6 +1140,17 @@ static void update_option_metadata(telnet_session *session)
         TELNET_OPT_NEW_ENVIRON
     );
 
+    session->terminal.mssp = telnet_q_enabled(
+        &session->options,
+        TELNET_Q_LOCAL,
+        TELNET_OPT_MSSP
+    );
+    session->terminal.gmcp = telnet_q_enabled(
+        &session->options,
+        TELNET_Q_LOCAL,
+        TELNET_OPT_GMCP
+    );
+
     /* NEW-ENVIRON is the carrier; MNES is the MUD-specific vocabulary. */
     session->terminal.mnes =
         (session->terminal.mtts_flags & TELNET_MTTS_MNES) != 0 ||
@@ -574,6 +1160,7 @@ static void update_option_metadata(telnet_session *session)
     request_terminal_type(session);
     request_charset(session);
     request_new_environ(session);
+    notify_application_capabilities(session);
 }
 
 static void negotiate_operational_options(telnet_session *session)
@@ -669,6 +1256,28 @@ static void negotiate_operational_options(telnet_session *session)
         &session->options,
         TELNET_Q_REMOTE,
         TELNET_OPT_NEW_ENVIRON,
+        1,
+        q_send_callback,
+        session
+    );
+
+    /* MSSP is only advertised when the host can supply a coherent snapshot. */
+    if (session->mssp_query != NULL) {
+        telnet_q_request(
+            &session->options,
+            TELNET_Q_LOCAL,
+            TELNET_OPT_MSSP,
+            1,
+            q_send_callback,
+            session
+        );
+    }
+
+    /* GMCP framing/Core support is generic; game packages remain application-owned. */
+    telnet_q_request(
+        &session->options,
+        TELNET_Q_LOCAL,
+        TELNET_OPT_GMCP,
         1,
         q_send_callback,
         session
@@ -803,6 +1412,24 @@ static void enter_game(telnet_session *session)
 
     audit_player_event(session, "login_success");
 
+    if (session->application.open != NULL) {
+        terminal_capabilities capabilities;
+        copy_terminal_capabilities(session, &capabilities);
+        session->application_session = session->application.open(
+            session->application.manager_context,
+            session->player_name,
+            &session->application_output,
+            &capabilities
+        );
+        if (session->application_session == NULL) {
+            request_close(session, "application_open_rejected", NULL);
+        } else {
+            replay_pre_auth_gmcp_core(session);
+        }
+        return;
+    }
+
+    /* Standalone fallback retained for protocol-focused harnesses and tests. */
     write_text(session, "\r\nWelcome, ");
     write_untrusted_text(session, session->player_name);
     write_text(
@@ -1135,6 +1762,17 @@ static void process_command(
         return;
     }
 
+    if (session->application_session != NULL && session->application.line != NULL) {
+        if (session->application.line(
+                session->application_session,
+                session->line,
+                session->line_length
+            ) != 0) {
+            request_close(session, "application_line_close", NULL);
+        }
+        return;
+    }
+
     if (session->line[0] == '\0') {
         write_prompt_text(session, "> ");
         return;
@@ -1194,6 +1832,15 @@ static void process_complete_line(
                 write_prompt_text(session, "Create password: ");
             }
 
+            return;
+        }
+
+        if (session->application_session != NULL) {
+            request_close(
+                session,
+                "application_input_overflow",
+                "Input is too long.\r\n"
+            );
             return;
         }
 
@@ -1276,9 +1923,18 @@ static void append_line_byte(
      * still validate names/passwords, so accept opaque high bytes here instead
      * of treating a harmless compatibility quirk as protocol abuse.
      */
-    if (session->line_length >= sizeof(session->line) - 1) {
-        session->line_overflow = 1;
-        return;
+    {
+        size_t limit =
+            session->login == LOGIN_PASSWORD ||
+            session->login == LOGIN_NEW_PASSWORD ||
+            session->login == LOGIN_CONFIRM_PASSWORD
+                ? PLAYER_PASSWORD_MAX
+                : APPLICATION_LINE_MAX;
+
+        if (session->line_length >= limit) {
+            session->line_overflow = 1;
+            return;
+        }
     }
 
     session->line[session->line_length++] = (char)byte;
@@ -1858,17 +2514,33 @@ static int env_name_equals(
     return bytes_equal_ignore_case(name, length, expected);
 }
 
+static int env_value_enabled(const unsigned char *value, size_t value_length)
+{
+    if (value_length == 1 && value[0] == '1') {
+        return 1;
+    }
+    if (bytes_equal_ignore_case(value, value_length, "TRUE") ||
+        bytes_equal_ignore_case(value, value_length, "YES") ||
+        bytes_equal_ignore_case(value, value_length, "ON")) {
+        return 1;
+    }
+    return 0;
+}
+
 static void apply_new_environ_value(
     telnet_session *session,
+    unsigned char token,
     const unsigned char *name,
     size_t name_length,
     const unsigned char *value,
     size_t value_length
 )
 {
-    /* The requested names below are the MNES extension vocabulary. */
+    int is_mnes_var = token == NEW_ENVIRON_VAR;
+
+    /* The five VAR names are the compact MNES vocabulary. */
     if (env_name_equals(name, name_length, "CLIENT_NAME")) {
-        session->mnes_observed = 1;
+        if (is_mnes_var) session->mnes_observed = 1;
         (void)copy_printable_ascii(
             session->terminal.client_name,
             sizeof(session->terminal.client_name),
@@ -1879,7 +2551,7 @@ static void apply_new_environ_value(
     }
 
     if (env_name_equals(name, name_length, "CLIENT_VERSION")) {
-        session->mnes_observed = 1;
+        if (is_mnes_var) session->mnes_observed = 1;
         (void)copy_printable_ascii(
             session->terminal.client_version,
             sizeof(session->terminal.client_version),
@@ -1890,7 +2562,7 @@ static void apply_new_environ_value(
     }
 
     if (env_name_equals(name, name_length, "TERMINAL_TYPE")) {
-        session->mnes_observed = 1;
+        if (is_mnes_var) session->mnes_observed = 1;
         if (copy_printable_ascii(
                 session->terminal.terminal_type,
                 sizeof(session->terminal.terminal_type),
@@ -1906,20 +2578,39 @@ static void apply_new_environ_value(
     }
 
     if (env_name_equals(name, name_length, "CHARSET")) {
-        session->mnes_observed = 1;
-        session->charset_utf8 =
-            bytes_equal_ignore_case(value, value_length, "UTF-8");
-        refresh_utf8_metadata(session);
+        if (is_mnes_var) session->mnes_observed = 1;
+        if (bytes_equal_ignore_case(value, value_length, "UTF-8")) {
+            session->charset_utf8 = 1;
+            refresh_utf8_metadata(session);
+        }
         return;
     }
 
     if (env_name_equals(name, name_length, "MTTS")) {
-        session->mnes_observed = 1;
         uint32_t flags;
+        if (is_mnes_var) session->mnes_observed = 1;
         if (parse_decimal_u32(value, value_length, &flags)) {
             apply_mtts_flags(session, flags);
             refresh_utf8_metadata(session);
         }
+        return;
+    }
+
+    /* The remaining capabilities are modern NEW-ENVIRON USERVAR values. */
+    if (token != NEW_ENVIRON_USERVAR) {
+        return;
+    }
+
+    if (env_name_equals(name, name_length, "SCREEN_READER")) {
+        session->terminal.screen_reader = env_value_enabled(value, value_length);
+    } else if (env_name_equals(name, name_length, "OSC_HYPERLINKS")) {
+        session->terminal.osc8 = env_value_enabled(value, value_length);
+    } else if (env_name_equals(name, name_length, "OSC_HYPERLINKS_SEND")) {
+        session->terminal.osc8_send = env_value_enabled(value, value_length);
+    } else if (env_name_equals(name, name_length, "OSC_HYPERLINKS_PROMPT")) {
+        session->terminal.osc8_prompt = env_value_enabled(value, value_length);
+    } else if (env_name_equals(name, name_length, "OSC_HYPERLINKS_TOOLTIP")) {
+        session->terminal.osc8_tooltip = env_value_enabled(value, value_length);
     }
 }
 
@@ -2026,9 +2717,10 @@ static void handle_new_environ(telnet_session *session)
             }
         }
 
-        if (token == NEW_ENVIRON_VAR && name_length > 0) {
+        if (name_length > 0) {
             apply_new_environ_value(
                 session,
+                token,
                 name,
                 name_length,
                 value,
@@ -2059,6 +2751,10 @@ static void finish_subnegotiation(telnet_session *session)
             handle_new_environ(session);
             break;
 
+        case TELNET_OPT_GMCP:
+            handle_gmcp(session);
+            break;
+
         default:
             /* Unknown subnegotiations already passed the size cap. Ignore them. */
             break;
@@ -2087,6 +2783,11 @@ static void receive_telnet_option(
         &session->options,
         TELNET_Q_REMOTE,
         TELNET_OPT_NEW_ENVIRON
+    );
+    int was_mssp = telnet_q_enabled(
+        &session->options,
+        TELNET_Q_LOCAL,
+        TELNET_OPT_MSSP
     );
 
     telnet_q_receive(
@@ -2132,6 +2833,19 @@ static void receive_telnet_option(
         )) {
         session->new_environ_requested = 0;
         session->mnes_observed = 0;
+        session->terminal.osc8 = 0;
+        session->terminal.osc8_send = 0;
+        session->terminal.osc8_prompt = 0;
+        session->terminal.osc8_tooltip = 0;
+    }
+
+    if (was_mssp &&
+        !telnet_q_enabled(
+            &session->options,
+            TELNET_Q_LOCAL,
+            TELNET_OPT_MSSP
+        )) {
+        session->mssp_sent = 0;
     }
 
     if (!telnet_q_enabled(
@@ -2148,6 +2862,10 @@ static void receive_telnet_option(
     }
 
     update_option_metadata(session);
+
+    if (!was_mssp && session->terminal.mssp) {
+        send_mssp_status(session);
+    }
 }
 
 int telnet_protocol_init(void)
@@ -2180,6 +2898,17 @@ telnet_session *telnet_session_create(
     session->audit = config->audit;
     session->writer = config->writer;
     session->writer_context = config->writer_context;
+    if (config->application != NULL) {
+        session->application = *config->application;
+    }
+    session->application_output.context = session;
+    session->application_output.write_text = application_write_text;
+    session->application_output.write_prompt = application_write_prompt;
+    session->application_output.request_close = application_request_close;
+    session->application_output.send_gmcp = application_send_gmcp;
+    session->application_output.write_link = application_write_link;
+    session->mssp_query = config->mssp_query;
+    session->mssp_context = config->mssp_context;
     session->login = LOGIN_NAME;
     session->parser = PARSER_DATA;
     session->terminal.width = DEFAULT_TERMINAL_WIDTH;
@@ -2217,6 +2946,10 @@ void telnet_session_destroy(telnet_session *session)
         return;
     }
 
+    if (session->application_session != NULL && session->application.close != NULL) {
+        session->application.close(session->application_session);
+        session->application_session = NULL;
+    }
     player_store_password_clear(&session->pending_password);
     sodium_memzero(session, sizeof(*session));
     free(session);

@@ -5,22 +5,23 @@
 #define SECURE_SERVER_H
 
 /*
- * Network transport and connection lifecycle for the C MUD boundary.
+ * Listener and connection-lifecycle owner for the reference server.
  *
- * This layer owns bind/listen/accept, TLS setup, worker lifetime, transport
- * deadlines, and shared connection admission. It deliberately does not own
- * Telnet framing or game commands: accepted byte streams are handed to the
- * Telnet session API in telnet_protocol.h.
+ * This is where sockets, TLS setup, SSH handoff, worker slots, and transport
+ * deadlines live. Telnet framing belongs to telnet_protocol; SSH packet and
+ * channel mechanics belong to libssh through ssh_transport.c. Once either side
+ * has an authenticated terminal session, both meet at terminal_application.
  *
- * Plain TCP exists because traditional MUD clients and basic Telnet remain a
- * compatibility target. TLS 1.3 is the preferred protected transport. Keeping
- * them as separate listeners avoids protocol sniffing and makes the security
- * properties of each endpoint explicit. A future SSH listener belongs beside
- * these transports and should feed the same higher-level account/game session,
- * not tunnel through this Telnet path.
+ * The three development endpoint types are separate on purpose. Plain Telnet
+ * keeps the traditional compatibility path, TLS makes the protected Telnet
+ * endpoint explicit, and SSH is a sibling terminal transport rather than
+ * Telnet hidden inside an SSH channel. The harness opens matching IPv4 and,
+ * when available, IPv6 loopback sockets for each endpoint.
  */
 
 #include <stdint.h>
+
+#include "telnet_protocol.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -29,18 +30,29 @@ extern "C" {
 typedef struct secure_server_config {
     const char *certificate_path;
     const char *private_key_path;
+    const char *ssh_host_key_path;
     const char *player_directory_path;
     const char *audit_log_path;
 
-    /* Plain Telnet is the compatibility endpoint; TLS Telnet is preferred. */
+    /* Optional owner called after Telnet or SSH has authenticated an account. */
+    const terminal_application_hooks *application;
+
+    /* Optional generic MSSP snapshot source for Telnet clients. */
+    telnet_mssp_query_fn mssp_query;
+    void *mssp_context;
+
     uint16_t telnet_port;
     uint16_t telnet_tls_port;
+
+    /* Set to zero to disable SSH. The standalone harness enables it on 3335. */
+    uint16_t ssh_port;
 } secure_server_config;
 
 /*
- * Runs both blocking listeners until SIGINT, SIGTERM, or a fatal listener
- * error. Runtime safeguards are shared across transports so opening a second
- * port does not double connection or authentication limits.
+ * Runs the configured blocking listeners until SIGINT, SIGTERM, or a fatal
+ * listener error. The accept loop polls only listener sockets; accepted clients
+ * run in bounded detached workers so a stalled terminal does not stall accept().
+ * Shared connection/authentication policy spans every enabled transport.
  */
 int secure_server_run(const secure_server_config *config);
 
